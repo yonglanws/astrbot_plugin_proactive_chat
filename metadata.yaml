@@ -3,7 +3,7 @@ display_name: "私聊主动消息"
 author: "DBJD-CR & 慵懒午睡"
 version: "v2.4.0"
 desc: "只面向私聊的主动消息插件：根据互动强度动态调整概率与间隔，并通过作息节律、关系状态、主动意图、回复质量、自然度守卫、气泡发送计划、心情/精力与开放话题让主动消息更自然。可选接入 LivingMemory 长期记忆、planner/critic 多阶段生成与离线回放。支持 QQ 官方机器人、上下文感知、免打扰、连续未回复暂停、TTS，以及 AstrBot 原生插件页面与独立 WebUI。"
-repo: "https://github.com/Pancakes-Labs/astrbot_plugin_proactive_chat"
+repo: "https://github.com/yonglanws/astrbot_plugin_proactive_chat"
 astrbot_version: ">=4.24.0"
 support_platforms:
   - aiocqhttp
