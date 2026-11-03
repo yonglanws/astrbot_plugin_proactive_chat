@@ -29,7 +29,9 @@ class OverrideStore:
         "schedule_settings",
         "tts_settings",
         "segmented_reply_settings",
-        "group_idle_trigger_minutes",
+        "pause_settings",
+        "intensity_settings",
+        "humanization_settings",
     }
 
     def __init__(self, storage_dir: Path):

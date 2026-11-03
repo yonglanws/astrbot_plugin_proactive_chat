@@ -185,14 +185,19 @@ class WebConsoleServer:
         if not self.app:
             return
 
+        # 同一份前端既作为 AstrBot 插件页面（views/），也由独立管理端挂载。
         # console 位于 core 下两级，故取 parents[2] 作为插件根目录。
-        admin_dir = Path(__file__).resolve().parents[2] / "admin"
-        if admin_dir.exists():
+        plugin_root = Path(__file__).resolve().parents[2]
+        ui_dir = plugin_root / "views" / "proactive-chat"
+        if not ui_dir.exists():
+            # 兼容旧部署目录。
+            ui_dir = plugin_root / "admin"
+        if ui_dir.exists():
             self.app.mount(
-                "/", StaticFiles(directory=str(admin_dir), html=True), name="admin"
+                "/", StaticFiles(directory=str(ui_dir), html=True), name="admin"
             )
         else:
-            logger.warning(f"[主动消息] 未找到管理端静态目录喵: {admin_dir}")
+            logger.warning(f"[主动消息] 未找到管理端静态目录喵: {ui_dir}")
 
     # ------------------------------------------------------------------
     # 广播（供通知中心与路由复用）
@@ -213,6 +218,7 @@ class WebConsoleServer:
                 "status": self.state_builder.build_status_payload(),
                 "jobs": self.state_builder.collect_jobs(),
                 "sessions": self.state_builder.list_known_session_summaries(),
+                "intensity": self.state_builder.collect_intensity_sessions(),
                 "notifications": await self.state_builder.build_notification_payload(),
             },
         }

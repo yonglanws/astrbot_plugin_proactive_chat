@@ -6,11 +6,12 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any
 
 from astrbot.api import logger
 
-from ...utils.time_utils import format_current_time
+from ...utils.time_utils import format_current_time, format_relative_gap
 from ..adapters.astrbot_event import dispatch_event_hook
 from ..adapters.astrbot_provider import build_provider_request, invoke_provider
 
@@ -36,6 +37,8 @@ class LlmService:
         *,
         include_time: bool = True,
         include_unanswered: bool = True,
+        intensity_snapshot: dict | None = None,
+        humanization: dict | None = None,
     ) -> str:
         """构建每轮都会变化的运行时上下文块。"""
         lines: list[str] = []
@@ -45,17 +48,120 @@ class LlmService:
         if include_unanswered:
             lines.append(f"- 本次主动消息的未回复累计次数：{unanswered_count}")
 
-        session_type = ""
-        if isinstance(session_config, dict):
-            session_type = str(session_config.get("_session_type") or "")
-        type_label = {"friend": "私聊", "group": "群聊"}.get(session_type, "")
-        if type_label:
-            lines.append(f"- 会话场景：{type_label}")
+        lines.append("- 会话场景：私聊")
+
+        if isinstance(intensity_snapshot, dict) and intensity_snapshot:
+            score = intensity_snapshot.get("score")
+            tier_label = intensity_snapshot.get("tier_label") or "未知"
+            probability = intensity_snapshot.get("probability_percent")
+            if score is not None:
+                lines.append(
+                    f"- 对方最近的互动强度：{tier_label}（{score}/100），"
+                    f"主动触发概率参考 {probability}%"
+                )
+                tier = intensity_snapshot.get("tier")
+                if tier in {"close", "blazing"}:
+                    lines.append(
+                        "- 对方最近聊得很投入：可以更主动地延续话题、表达想念或分享日常。"
+                    )
+                elif tier in {"dormant", "steady"}:
+                    lines.append(
+                        "- 对方最近聊得较少：语气宜轻、宜短，先试探性地开启话题。"
+                    )
+
+        if isinstance(humanization, dict) and humanization:
+            lines.extend(self._build_humanization_lines(humanization))
 
         if not lines:
             return ""
 
         return "<dynamic_context>\n" + "\n".join(lines) + "\n</dynamic_context>"
+
+    @staticmethod
+    def _build_humanization_lines(humanization: dict) -> list[str]:
+        """把关系状态、意图、精力与作息压缩成少量提示行。"""
+        lines: list[str] = []
+        state = humanization.get("conversation_state") or {}
+        if state.get("state_label"):
+            lines.append(
+                f"- 当前关系状态：{state['state_label']}"
+                + (
+                    f"（原因：{state['reason']}）"
+                    if state.get("reason")
+                    else ""
+                )
+            )
+        now = time.time()
+        last_user_at = state.get("last_user_at")
+        last_proactive_at = state.get("last_proactive_at")
+        if isinstance(last_user_at, (int, float)) and last_user_at > 0:
+            lines.append(
+                f"- 对方最后一条消息：{format_relative_gap(now - last_user_at)}"
+            )
+        if isinstance(last_proactive_at, (int, float)) and last_proactive_at > 0:
+            lines.append(
+                f"- 你上一次主动消息：{format_relative_gap(now - last_proactive_at)}"
+            )
+        intent_label = humanization.get("intent_label")
+        brief = humanization.get("intent_brief")
+        if intent_label:
+            lines.append(
+                f"- 本轮主动意图：{intent_label}"
+                + (f"。{brief}" if brief else "")
+            )
+
+        persona = humanization.get("persona") or {}
+        if persona.get("enabled"):
+            lines.append(
+                f"- 你此刻的状态：{persona.get('mood_label', '平静')}，"
+                f"精力 {persona.get('energy_percent', 60)}%，"
+                f"{persona.get('activity', '日常')}。"
+                "状态低时就短一点、轻一点，不要硬撑热情。"
+            )
+
+        rhythm = humanization.get("rhythm") or {}
+        if rhythm.get("enabled"):
+            daily = (
+                f"{rhythm.get('daily_count', 0)}/{rhythm.get('daily_limit', 0)}"
+                if rhythm.get("daily_limit")
+                else str(rhythm.get("daily_count", 0))
+            )
+            lines.append(
+                f"- 今日已主动发送：{daily} 次；"
+                f"对方通常活跃时段：{rhythm.get('active_hours_label', '样本不足')}。"
+            )
+
+        conversation_memory = humanization.get("conversation_memory") or {}
+        if conversation_memory.get("enabled"):
+            open_loop_count = int(
+                conversation_memory.get("open_loop_count", 0) or 0
+            )
+            if open_loop_count > 0:
+                lines.append(
+                    f"- 还有 {open_loop_count} 个未闭环话题；"
+                    "优先自然跟进其中一条，不要逐条追问。"
+                )
+            profile_text = str(
+                conversation_memory.get("profile_summary") or ""
+            ).strip()
+            if profile_text:
+                lines.append(f"- 对方表达习惯：{profile_text}")
+
+        plan = humanization.get("plan") or {}
+        if plan:
+            plan_parts = []
+            if plan.get("topic"):
+                plan_parts.append(f"话题={plan['topic']}")
+            if plan.get("goal"):
+                plan_parts.append(f"目标={plan['goal']}")
+            if plan.get("tone"):
+                plan_parts.append(f"语气={plan['tone']}")
+            if plan.get("avoid"):
+                plan_parts.append(f"避免={plan['avoid']}")
+            if plan_parts:
+                lines.append("- 本轮写作计划：" + "；".join(plan_parts))
+
+        return lines
 
     def build_extra_content_parts(
         self,
@@ -63,6 +169,10 @@ class LlmService:
         prompt_template: str,
         unanswered_count: int,
         session_config: dict | None = None,
+        intensity_snapshot: dict | None = None,
+        humanization: dict | None = None,
+        memory_context: str = "",
+        topic_context: str = "",
     ) -> list:
         """构建追加在本轮用户消息之后的临时内容块列表。"""
         parts: list = []
@@ -71,11 +181,27 @@ class LlmService:
             if part is not None:
                 parts.append(part)
 
+        if memory_context:
+            memory_part = self.plugin.context_service.make_temp_text_part(
+                memory_context
+            )
+            if memory_part is not None:
+                parts.append(memory_part)
+
+        if topic_context:
+            topic_part = self.plugin.context_service.make_temp_text_part(
+                topic_context
+            )
+            if topic_part is not None:
+                parts.append(topic_part)
+
         dynamic_text = self.build_dynamic_context_text(
             unanswered_count,
             session_config,
             include_time="{{current_time}}" not in prompt_template,
             include_unanswered="{{unanswered_count}}" not in prompt_template,
+            intensity_snapshot=intensity_snapshot,
+            humanization=humanization,
         )
         if dynamic_text:
             dynamic_part = self.plugin.context_service.make_temp_text_part(dynamic_text)
@@ -146,29 +272,93 @@ class LlmService:
         conversation: Any = None,
         platform_context: str = "",
         model: str | None = None,
+        intensity_snapshot: dict | None = None,
+        humanization: dict | None = None,
+        memory_context: str = "",
+        topic_context: str = "",
     ) -> tuple[Any | None, str]:
         """统一 LLM 调用入口。
 
         model 为 None 时使用 Provider 自身的默认模型；传入非空值时仅覆盖本次
         请求的模型，供后续按场景（压缩、降级、专用模型）分层调用复用。
+
+        intensity_snapshot 由 GATE 阶段产出，用于把「互动强度」注入提示词，
+        让模型据此调整语气与主动性。
         """
         plugin = self.plugin
         motivation_template = session_config.get("proactive_prompt", "") or ""
         now_str = format_current_time(plugin.timezone)
-        final_user_simulation_prompt = motivation_template.replace(
-            "{{unanswered_count}}", str(unanswered_count)
-        ).replace("{{current_time}}", now_str)
+        intensity_score = ""
+        intensity_tier = ""
+        intensity_probability = ""
+        if isinstance(intensity_snapshot, dict) and intensity_snapshot:
+            intensity_score = str(intensity_snapshot.get("score", ""))
+            intensity_tier = str(intensity_snapshot.get("tier_label", ""))
+            intensity_probability = str(
+                intensity_snapshot.get("probability_percent", "")
+            )
 
-        logger.debug("[主动消息] 已生成包含动机和时间的 Prompt 喵。")
+        humanization = humanization if isinstance(humanization, dict) else {}
+        conversation_state = humanization.get("conversation_state") or {}
+        persona = humanization.get("persona") or {}
+        rhythm = humanization.get("rhythm") or {}
+        state_label = str(conversation_state.get("state_label") or "")
+        intent_label = str(humanization.get("intent_label") or "")
+        intent_brief = str(humanization.get("intent_brief") or "")
+        persona_text = (
+            f"{persona.get('mood_label', '平静')}，精力 "
+            f"{persona.get('energy_percent', 60)}%，{persona.get('activity', '日常')}"
+            if persona
+            else ""
+        )
+        active_hours = str(rhythm.get("active_hours_label") or "")
+        daily_budget = (
+            f"{rhythm.get('daily_count', 0)}/{rhythm.get('daily_limit', 0)}"
+            if rhythm.get("daily_limit")
+            else ""
+        )
+
+        final_user_simulation_prompt = (
+            motivation_template.replace("{{unanswered_count}}", str(unanswered_count))
+            .replace("{{current_time}}", now_str)
+            .replace("{{intensity_score}}", intensity_score)
+            .replace("{{intensity_tier}}", intensity_tier)
+            .replace("{{intensity_probability}}", intensity_probability)
+            .replace("{{conversation_state}}", state_label)
+            .replace("{{intent}}", intent_label)
+            .replace("{{intent_brief}}", intent_brief)
+            .replace("{{persona_state}}", persona_text)
+            .replace("{{active_hours}}", active_hours)
+            .replace("{{daily_budget}}", daily_budget)
+            .replace("{{memory_block}}", memory_context or "")
+            .replace("{{topic_ledger}}", topic_context or "")
+        )
+
+        logger.debug("[主动消息] 已生成包含动机、时间与互动强度的 Prompt 喵。")
 
         history_messages = plugin.context_service.sanitize_history_content(
             history_messages or []
         )
+        # prompt_context 关闭时不追加强度动态上下文；用户在模板里显式写的
+        # 占位符仍会正常替换，避免“配置关闭”与“模板要求”互相打架。
+        context_intensity_snapshot = intensity_snapshot
+        intensity_service = getattr(plugin, "intensity_service", None)
+        if intensity_service is not None:
+            try:
+                if not intensity_service.get_settings(session_config).prompt_context:
+                    context_intensity_snapshot = None
+            except Exception:
+                pass
+
         extra_parts = self.build_extra_content_parts(
             platform_context=platform_context,
             prompt_template=motivation_template,
             unanswered_count=unanswered_count,
             session_config=session_config,
+            intensity_snapshot=context_intensity_snapshot,
+            humanization=humanization,
+            memory_context=memory_context,
+            topic_context=topic_context,
         )
 
         provider = await self.resolve_chat_provider(session_id)

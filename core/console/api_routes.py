@@ -16,6 +16,8 @@ from typing import Any
 
 from astrbot.api import logger
 
+from ..domain.domain_enums import TriggerSource
+
 # 注意：WebSocket / FileResponse / JSONResponse 必须在模块全局命名空间可用。
 try:  # pragma: no cover - 取决于是否安装 FastAPI
     from fastapi import WebSocket, WebSocketDisconnect
@@ -167,10 +169,12 @@ class ApiRoutes:
             web_admin = {
                 k: v for k, v in _config_group("web_admin").items() if k != "password"
             }
-            # 返回所有可编辑分组，保证前端渲染的字段与服务端保存范围一致。
+            # 私聊配置：优先 private_settings，兼容旧版 friend_settings。
+            private_settings = _config_group("private_settings")
+            if not private_settings:
+                private_settings = _config_group("friend_settings")
             return {
-                "friend_settings": _config_group("friend_settings"),
-                "group_settings": _config_group("group_settings"),
+                "private_settings": private_settings,
                 "web_admin": web_admin,
                 "notification_settings": _config_group("notification_settings"),
                 "telemetry_config": _config_group("telemetry_config"),
@@ -194,12 +198,14 @@ class ApiRoutes:
         @app.post("/api/config")
         async def update_config(payload: dict[str, Any]):
             allowed_keys = {
-                "friend_settings",
-                "group_settings",
+                "private_settings",
                 "web_admin",
                 "notification_settings",
                 "telemetry_config",
             }
+            # 兼容旧前端/旧配置：若只提交 friend_settings，则映射到 private_settings。
+            if "friend_settings" in payload and "private_settings" not in payload:
+                payload["private_settings"] = payload["friend_settings"]
             # 分组必须是对象：若写入 null，后续 GET /api/config 的 dict(...) 会抛错，
             # 配置编辑器将无法重新加载，只能手动改配置文件才能恢复。
             invalid_keys = [
@@ -328,7 +334,7 @@ class ApiRoutes:
                 if not base:
                     return JSONResponse(
                         {
-                            "error": "会话未命中 friend/group 全局配置，无法保存 effective"
+                            "error": "会话未命中 private_settings 私聊全局配置，无法保存 effective"
                         },
                         status_code=400,
                     )
@@ -362,6 +368,13 @@ class ApiRoutes:
         async def list_jobs():
             return {"jobs": state.collect_jobs()}
 
+        # 互动强度面板：按分数从高到低返回所有私聊会话。
+        @app.get("/api/intensity")
+        async def list_intensity():
+            sessions = state.collect_intensity_sessions()
+            summary = state.build_intensity_summary()
+            return {"sessions": sessions, "summary": summary}
+
         # 手动重新调度下一次主动消息（不重置未回复计数）。
         @app.post("/api/jobs/{umo:path}/reschedule")
         async def reschedule_job(umo: str):
@@ -375,6 +388,16 @@ class ApiRoutes:
                         "error": "会话未启用或配置不存在，无法重新调度",
                     },
                     status_code=400,
+                )
+
+            if plugin.scheduler_service.is_session_paused(normalized):
+                return JSONResponse(
+                    {
+                        "ok": False,
+                        "session": normalized,
+                        "error": "会话处于未回复暂停中，请先恢复或等待用户发来新消息",
+                    },
+                    status_code=409,
                 )
 
             await plugin.scheduler_service.schedule_next_chat_and_save(
@@ -540,6 +563,15 @@ class ApiRoutes:
         @app.post("/api/jobs/{umo:path}/trigger")
         async def trigger_job(umo: str):
             normalized = plugin.session_service.normalize_session_id(umo)
+            if plugin.scheduler_service.is_session_paused(normalized):
+                return JSONResponse(
+                    {
+                        "ok": False,
+                        "session": normalized,
+                        "error": "会话处于未回复暂停中，请先恢复或等待用户发来新消息",
+                    },
+                    status_code=409,
+                )
             if normalized in plugin.manual_trigger_sessions:
                 return JSONResponse(
                     {
@@ -553,13 +585,46 @@ class ApiRoutes:
 
             plugin.manual_trigger_sessions.add(normalized)
             # 纳入统一任务登记，插件终止时可被一并取消，避免游离后台任务。
-            plugin._track_task(asyncio.create_task(plugin.check_and_chat(normalized)))
+            plugin._track_task(
+                asyncio.create_task(
+                    plugin.check_and_chat(normalized, TriggerSource.MANUAL)
+                )
+            )
             await _broadcast_web_update("jobs")
             return {
                 "ok": True,
                 "session": normalized,
                 "in_progress": True,
                 "message": "已开始立即触发，正在等待 LLM 完成回复",
+            }
+
+        # 解除「连续未回复」暂停，并立即重新安排下一次主动消息。
+        @app.post("/api/jobs/{umo:path}/resume")
+        async def resume_job(umo: str):
+            normalized = plugin.session_service.normalize_session_id(umo)
+            session_config = plugin.config_service.get_session_config(normalized)
+            if not session_config or not session_config.get("enable", False):
+                return JSONResponse(
+                    {
+                        "ok": False,
+                        "session": normalized,
+                        "error": "会话未启用或配置不存在，无法恢复",
+                    },
+                    status_code=400,
+                )
+
+            resumed = plugin.scheduler_service.resume_session(
+                normalized, clear_cooldown=True
+            )
+            await plugin.scheduler_service.schedule_next_chat_and_save(
+                normalized, reset_counter=True
+            )
+            await _broadcast_web_update("jobs")
+            return {
+                "ok": True,
+                "session": normalized,
+                "resumed": bool(resumed),
+                "message": "已解除未回复暂停并重新安排下一次主动消息",
             }
 
         # 取消会话已注册的调度任务，并清除其持久化的触发时间。
@@ -614,6 +679,7 @@ class ApiRoutes:
                             "status": state.build_status_payload(),
                             "jobs": state.collect_jobs(),
                             "sessions": state.list_known_session_summaries(),
+                            "intensity": state.collect_intensity_sessions(),
                             "notifications": await state.build_notification_payload(),
                         },
                     }
@@ -646,6 +712,7 @@ class ApiRoutes:
                                     "status": state.build_status_payload(),
                                     "jobs": state.collect_jobs(),
                                     "sessions": state.list_known_session_summaries(),
+                                    "intensity": state.collect_intensity_sessions(),
                                     "notifications": await state.build_notification_payload(),
                                 },
                             }

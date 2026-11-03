@@ -15,7 +15,7 @@ from ...utils.time_utils import is_quiet_time
 from ..adapters.astrbot_conversation import add_message_pair, verify_message_persisted
 from ..domain.domain_enums import HookPoint, StageResult, TriggerSource
 from ..domain.request_context import ProactiveContext
-from ..domain.session_key import is_friend_type, is_group_type
+from ..domain.session_key import is_friend_type
 from ..features.feature_manifest import build_default_features
 from .feature_registry import FeatureRegistry
 from .flow_context import build_context
@@ -49,8 +49,16 @@ class FlowOrchestrator:
         return None
 
     async def _on_reschedule(self, ctx: ProactiveContext, reset: bool) -> None:
-        """需要重新调度下一次主动消息。"""
-        await self.plugin.scheduler_service.schedule_next_chat_and_save(ctx.session_id)
+        """需要重新调度下一次主动消息。
+
+        互动强度概率未命中时，GATE 会把一个较短的 ``retry_after_seconds``
+        放进 ctx.extra；此时使用短重试窗口，让高热度用户更快获得下一次机会。
+        """
+        retry_after = ctx.extra.get("retry_after_seconds")
+        await self.plugin.scheduler_service.schedule_next_chat_and_save(
+            ctx.session_id,
+            forced_interval_seconds=retry_after if retry_after else None,
+        )
 
     async def _on_abort(self, ctx: ProactiveContext, error: Exception | None) -> None:
         """阶段异常时的兜底：清理调度痕迹并尝试重调度。
@@ -105,6 +113,15 @@ class FlowOrchestrator:
             return
 
         normalized_session_id = plugin.session_service.normalize_session_id(session_id)
+        # 全链路私聊守卫：任何来源（定时器 / 自动触发 / Web 手动）都不能
+        # 为群聊会话生成主动消息。
+        parsed = plugin.session_service.parse_session_id(normalized_session_id)
+        if parsed and not is_friend_type(parsed[1]):
+            logger.warning(
+                f"[主动消息] 拒绝为非私聊会话执行主动消息喵: {normalized_session_id}"
+            )
+            return
+
         try:
             session_config = plugin.config_service.get_session_config(
                 normalized_session_id
@@ -134,26 +151,20 @@ class FlowOrchestrator:
         finally:
             await self.clear_manual_trigger_state(normalized_session_id)
 
-    async def _cleanup_group_schedule_state(self, session_id: str) -> None:
-        """群聊成功发送后清理残留调度状态（与旧实现时机一致）。"""
-        plugin = self.plugin
-        parsed = plugin.session_service.parse_session_id(session_id)
-        session_is_group = bool(parsed) and is_group_type(parsed[1])
-        if session_is_group:
-            async with plugin.data_lock:
-                if plugin.scheduler_service.clear_session_schedule_state(session_id):
-                    await plugin.storage_service.save_data()
-
     # ------------------------------------------------------------------
     # 准入与收尾（供 Feature 复用）
     # ------------------------------------------------------------------
     async def is_chat_allowed(self, session_id: str) -> tuple[bool, str]:
         """检查是否允许进行主动聊天，并返回阻断原因。
 
-        阻断原因：session_config_missing / session_disabled / quiet_hours。
-        allowed 表示通过校验。
+        阻断原因：not_private / session_config_missing / session_disabled /
+        quiet_hours。allowed 表示通过校验。
         """
         plugin = self.plugin
+        parsed = plugin.session_service.parse_session_id(session_id)
+        if parsed and not is_friend_type(parsed[1]):
+            return False, "not_private"
+
         session_config = plugin.config_service.get_session_config(session_id)
         if not session_config:
             return False, "session_config_missing"
@@ -173,11 +184,12 @@ class FlowOrchestrator:
         user_prompt: str,
         assistant_response: str,
         unanswered_count: int,
+        intent: str | None = None,
     ) -> None:
         """主动消息任务完成后的收尾工作。
 
-        步骤：存档对话历史并回读校验 -> 递增未回复计数 -> 私聊安排下一次调度 ->
-        群聊清理残留调度状态。
+        步骤：存档对话历史并回读校验 -> 递增未回复计数 ->
+        记录本次主动消息（用于回复率统计） -> 计算强度修正后的下一次调度。
         """
         plugin = self.plugin
         if getattr(plugin, "_terminating", False):
@@ -211,11 +223,19 @@ class FlowOrchestrator:
 
         normalized_session_id = plugin.session_service.normalize_session_id(session_id)
         parsed = plugin.session_service.parse_session_id(normalized_session_id)
-        is_private_session = bool(parsed) and is_friend_type(parsed[1])
-        session_config = None
+        if parsed and not is_friend_type(parsed[1]):
+            logger.warning(
+                f"[主动消息] 非私聊会话，跳过收尾与重调度喵: {normalized_session_id}"
+            )
+            return
+
+        session_config = plugin.config_service.get_session_config(normalized_session_id)
+        if not session_config:
+            return
+
         scheduled_job_payload = None
 
-        # 递增未回复计数并落盘；私聊额外计算并写入下一次调度时间。
+        # 递增未回复计数、记录主动消息、计算并写入下一次调度。
         async with plugin.data_lock:
             new_unanswered_count = unanswered_count + 1
             plugin.session_data.setdefault(normalized_session_id, {})[
@@ -225,39 +245,107 @@ class FlowOrchestrator:
                 f"[主动消息] {plugin.session_service.get_session_log_str(normalized_session_id)} 的第 {new_unanswered_count} 次主动消息已发送完成，当前未回复次数: {new_unanswered_count} 次喵。"
             )
 
-            if is_private_session:
-                session_config = plugin.config_service.get_session_config(
+            try:
+                decision_score = (
+                    plugin.intensity_service.get_state(normalized_session_id)
+                    .get("last_decision", {})
+                    .get("score")
+                )
+                plugin.intensity_service.record_proactive_sent(
+                    normalized_session_id,
+                    settings=plugin.intensity_service.get_settings(session_config),
+                    score=decision_score,
+                )
+            except Exception as e:
+                logger.debug(f"[主动消息] 记录主动消息强度事件失败喵: {e}")
+
+            # 作息、关系状态、人格状态与自然度守卫共享同一次发送记录。
+            try:
+                rhythm_service = getattr(plugin, "rhythm_service", None)
+                if rhythm_service is not None:
+                    rhythm_service.record_proactive_sent(normalized_session_id)
+                state_service = getattr(plugin, "conversation_state_service", None)
+                if state_service is not None:
+                    state_service.record_proactive_sent(
+                        normalized_session_id,
+                        intent or "continue_topic",
+                    )
+                conversation_memory = getattr(
+                    plugin, "conversation_memory_service", None
+                )
+                if conversation_memory is not None:
+                    conversation_memory.record_proactive(
+                        normalized_session_id,
+                        assistant_response,
+                        intent or "continue_topic",
+                        session_config=session_config,
+                    )
+                persona_service = getattr(plugin, "persona_state_service", None)
+                if persona_service is not None:
+                    persona_service.record_proactive_sent(
+                        normalized_session_id,
+                        session_config=session_config,
+                    )
+                guard_service = getattr(plugin, "guard_service", None)
+                if guard_service is not None and (assistant_response or "").strip():
+                    guard_service.record_sent_text(
+                        normalized_session_id, assistant_response
+                    )
+            except Exception as e:
+                logger.debug(f"[主动消息] 记录拟人化状态失败喵: {e}")
+
+            if plugin.scheduler_service.is_session_paused(normalized_session_id):
+                plugin.scheduler_service.clear_session_schedule_state(
                     normalized_session_id
                 )
-                if not session_config:
-                    return
-
-                schedule_conf = session_config.get("schedule_settings", {})
-                (
-                    run_date,
-                    scheduled_at,
-                    min_interval,
-                    max_interval,
-                    random_interval,
-                    next_trigger_time,
-                ) = plugin.scheduler_service.compute_next_trigger(schedule_conf)
-
-                session_payload = plugin.session_data.setdefault(
-                    normalized_session_id, {}
+                await plugin.storage_service.save_data()
+                logger.info(
+                    f"[主动消息] {plugin.session_service.get_session_log_str(normalized_session_id)} 已处于未回复暂停中，本次发送后不再安排下一次主动消息喵。"
                 )
-                session_payload["next_trigger_time"] = next_trigger_time
-                session_payload["last_scheduled_at"] = scheduled_at
-                session_payload["last_schedule_min_interval_seconds"] = min_interval
-                session_payload["last_schedule_max_interval_seconds"] = max_interval
-                session_payload["last_schedule_random_interval_seconds"] = (
-                    random_interval
-                )
-                scheduled_job_payload = {
-                    "run_date": run_date,
-                    "session_config": session_config,
-                }
+                return
+
+            schedule_conf = session_config.get("schedule_settings", {})
+            (
+                run_date,
+                scheduled_at,
+                min_interval,
+                max_interval,
+                random_interval,
+                next_trigger_time,
+                intensity_score,
+            ) = plugin.scheduler_service.compute_next_trigger(
+                schedule_conf, session_id=normalized_session_id
+            )
+
+            session_payload = plugin.session_data.setdefault(
+                normalized_session_id, {}
+            )
+            session_payload["next_trigger_time"] = next_trigger_time
+            session_payload["last_scheduled_at"] = scheduled_at
+            session_payload["last_schedule_min_interval_seconds"] = min_interval
+            session_payload["last_schedule_max_interval_seconds"] = max_interval
+            session_payload["last_schedule_random_interval_seconds"] = random_interval
+            if intensity_score is not None:
+                session_payload["last_schedule_intensity_score"] = intensity_score
+            scheduled_job_payload = {
+                "run_date": run_date,
+                "session_config": session_config,
+            }
 
             await plugin.storage_service.save_data()
+
+        # 主动消息不会经过 AstrBot 的 on_llm_response 钩子，因此需要显式
+        # 写回外部长期记忆插件的会话库，保证后续召回能看到这句话。
+        memory_bridge = getattr(plugin, "memory_bridge", None)
+        if memory_bridge is not None and (assistant_response or "").strip():
+            try:
+                await memory_bridge.store_proactive(
+                    normalized_session_id,
+                    assistant_response,
+                    session_config=session_config,
+                )
+            except Exception as e:
+                logger.debug(f"[主动消息] 写回长期记忆失败喵: {e}")
 
         if scheduled_job_payload is not None:
             plugin.scheduler_service.add_chat_job(
@@ -266,9 +354,6 @@ class FlowOrchestrator:
             logger.info(
                 f"[主动消息] 已为 {plugin.session_service.get_session_log_str(normalized_session_id, scheduled_job_payload['session_config'])} 安排下一次主动消息喵，时间：{scheduled_job_payload['run_date'].strftime('%Y-%m-%d %H:%M:%S')} 喵。"
             )
-
-        # 群聊由沉默倒计时驱动，不依赖持久化调度字段，故在成功发送后清理残留状态。
-        await self._cleanup_group_schedule_state(normalized_session_id)
 
     async def clear_manual_trigger_state(self, session_id: str) -> None:
         """释放指定会话的手动触发占用状态，并向管理端广播任务刷新。"""

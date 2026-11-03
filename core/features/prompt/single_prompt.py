@@ -41,6 +41,10 @@ class DeliberateStage(BaseStage):
             event=ctx.event,
             conversation=extra.get("conversation"),
             platform_context=extra.get("platform_context", ""),
+            intensity_snapshot=extra.get("intensity"),
+            humanization=extra.get("humanization"),
+            memory_context=extra.get("memory_context", ""),
+            topic_context=extra.get("topic_context", ""),
         )
         if not llm_response:
             # LLM 调用失败或无返回：中止并重调度。

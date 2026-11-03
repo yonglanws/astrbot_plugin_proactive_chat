@@ -32,6 +32,7 @@ class RecordStage(BaseStage):
             extra.get("final_user_prompt", ""),
             extra.get("response_text", ""),
             ctx.unanswered_count,
+            intent=extra.get("intent"),
         )
         return StageResult.CONTINUE
 

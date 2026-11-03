@@ -16,6 +16,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.core.config.astrbot_config import AstrBotConfig
 
 from .core.adapters.event_handlers import EventHandlers
+from .core.console.page_api import PageApiRoutes
 from .core.console.runtime_server import WebConsoleServer
 from .core.domain.domain_enums import TriggerSource
 from .core.pipeline.flow_orchestrator import FlowOrchestrator
@@ -23,12 +24,21 @@ from .core.remote.notification_center import NotificationCenter
 from .core.remote.telemetry_manager import TelemetryManager
 from .core.services.config_service import ConfigService
 from .core.services.context_service import ContextService
+from .core.services.conversation_memory_service import ConversationMemoryService
+from .core.services.conversation_state_service import ConversationStateService
+from .core.services.generation_service import CriticService, PlannerService
+from .core.services.guard_service import GuardService
+from .core.services.intensity_service import IntensityService
 from .core.services.lifecycle_service import LifecycleService
 from .core.services.llm_service import LlmService
+from .core.services.memory_bridge import MemoryBridge
+from .core.services.persona_state_service import PersonaStateService
+from .core.services.rhythm_service import RhythmService
 from .core.services.scheduler_service import SchedulerService
 from .core.services.sender_service import SenderService
 from .core.services.session_service import SessionService
 from .core.services.storage_service import StorageService
+from .core.services.topic_judge import TopicJudgeService
 from .core.store.override_store import OverrideStore
 from .utils.version_utils import get_plugin_version
 
@@ -63,6 +73,20 @@ class ProactiveChatPlugin(star.Star):
         self.session_service = SessionService(self)
         self.storage_service = StorageService(self)
         self.config_service = ConfigService(self)
+        # 私聊互动强度：驱动主动消息的触发概率与间隔。
+        self.intensity_service = IntensityService(self)
+        # 作息、关系状态、人格状态与自然度守卫：让主动消息更像人。
+        self.rhythm_service = RhythmService(self)
+        self.conversation_state_service = ConversationStateService(self)
+        self.conversation_memory_service = ConversationMemoryService(self)
+        self.persona_state_service = PersonaStateService(self)
+        self.planner_service = PlannerService(self)
+        self.critic_service = CriticService(self)
+        self.guard_service = GuardService(self)
+        # 复用已安装的长期记忆插件（LivingMemory），未安装时自动降级。
+        self.memory_bridge = MemoryBridge(self)
+        # 连续未回复暂停后，用一次轻量 LLM 判定是否重新开启话题。
+        self.topic_judge_service = TopicJudgeService(self)
         self.scheduler_service = SchedulerService(self)
         self.context_service = ContextService(self)
         self.llm_service = LlmService(self)
@@ -76,6 +100,8 @@ class ProactiveChatPlugin(star.Star):
 
         # 通知中心与 Web 控制台
         self.notification_center = NotificationCenter(self)
+        # AstrBot 原生插件页面（views/）后端；旧版 AstrBot 会自动跳过。
+        self.page_api = PageApiRoutes(self)
         try:
             self.web_admin_server = WebConsoleServer(self)
         except Exception as e:
@@ -99,10 +125,7 @@ class ProactiveChatPlugin(star.Star):
         self._startup_lock: asyncio.Lock | None = None
         self._startup_task: asyncio.Task[None] | None = None
 
-        # 群聊沉默倒计时与自动触发计时器
-        self.group_timers: dict[str, asyncio.TimerHandle] = {}
-        self.last_bot_message_time = 0
-        self.session_temp_state: dict[str, dict] = {}
+        # 自动触发计时器（仅私聊）。本插件不再维护群聊沉默计时器。
         self.last_message_times: dict[str, float] = {}
         self.auto_trigger_timers: dict[str, asyncio.TimerHandle] = {}
         self.plugin_start_time = time.time()
@@ -243,22 +266,25 @@ class ProactiveChatPlugin(star.Star):
 
     @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE, priority=999)
     async def on_friend_message(self, event: AstrMessageEvent) -> None:
-        """私聊消息入口。"""
+        """私聊消息入口。
+
+        本插件只处理私聊：不注册任何群聊监听器，因此不会产生群聊主动消息，
+        也不会在群聊里读取或写入任何状态。
+        """
         await self.event_handlers.on_friend_message(event)
-
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=998)
-    async def on_group_message(self, event: AstrMessageEvent) -> None:
-        """群聊消息入口。"""
-        await self.event_handlers.on_group_message(event)
-
-    @filter.after_message_sent()
-    async def on_after_message_sent(self, event: AstrMessageEvent) -> None:
-        """消息发送后入口。"""
-        await self.event_handlers.on_after_message_sent(event)
 
     # ==================================================================
     # 主动消息主流程
     # ==================================================================
-    async def check_and_chat(self, session_id: str) -> None:
-        """由定时任务触发的核心函数，完成一次完整的主动消息流程。"""
-        await self.orchestrator.run(session_id, TriggerSource.SCHEDULE)
+    async def check_and_chat(
+        self,
+        session_id: str,
+        trigger: TriggerSource = TriggerSource.SCHEDULE,
+    ) -> None:
+        """主动消息核心入口。
+
+        触发来源决定 GATE 行为：
+        - SCHEDULE / AUTO_TRIGGER 会按互动强度掷骰；
+        - MANUAL（Web 管理端立即触发）跳过概率判定。
+        """
+        await self.orchestrator.run(session_id, trigger)

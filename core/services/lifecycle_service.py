@@ -55,6 +55,14 @@ class LifecycleService:
             await plugin.storage_service.load_data()
         logger.info("[主动消息] 已成功从文件加载会话数据喵。")
 
+        # 注册 AstrBot 原生插件页面后端 API（旧版 AstrBot 自动跳过）。
+        page_api = getattr(plugin, "page_api", None)
+        if page_api is not None:
+            try:
+                page_api.register()
+            except Exception as e:
+                logger.warning(f"[主动消息] 注册插件页面 API 失败喵: {e}")
+
         # 解析时区；无效配置回退为服务器系统时区（None）。
         try:
             plugin.timezone = zoneinfo.ZoneInfo(
@@ -132,6 +140,14 @@ class LifecycleService:
                         )
                     )
                 )
+
+        # 提前探测外部长期记忆插件，便于管理端状态页展示是否已连接。
+        memory_bridge = getattr(plugin, "memory_bridge", None)
+        if memory_bridge is not None:
+            try:
+                await memory_bridge.is_available()
+            except Exception as e:
+                logger.debug(f"[主动消息] 探测长期记忆插件失败喵: {e}")
 
     def are_platforms_available(self) -> bool:
         """判断是否已有可用的 IM 平台适配器实例。"""
@@ -271,17 +287,7 @@ class LifecycleService:
             except Exception as e:
                 logger.error(f"[主动消息] 关闭调度器时出错喵: {e}")
 
-        # 取消所有群聊沉默计时器。
-        timer_count = len(plugin.group_timers)
-        for session_id, timer in list(plugin.group_timers.items()):
-            try:
-                timer.cancel()
-            except Exception as e:
-                logger.warning(f"[主动消息] 取消计时器时出错喵: {e}")
-        plugin.group_timers.clear()
-        logger.info(f"[主动消息] 已取消 {timer_count} 个正在运行的群聊沉默计时器喵。")
-
-        # 取消所有自动触发计时器。
+        # 取消所有私聊自动触发计时器。
         auto_trigger_count = len(plugin.auto_trigger_timers)
         for session_id, timer in list(plugin.auto_trigger_timers.items()):
             try:

@@ -29,7 +29,6 @@ from ..adapters.astrbot_event import (
     resolve_message_type,
 )
 from ..adapters.astrbot_platform import find_platform_by_id
-from ..domain.session_key import is_group_umo
 
 try:  # pragma: no cover - 取决于 AstrBot 版本
     from astrbot.core.star.star_handler import EventType
@@ -460,11 +459,12 @@ class SenderService:
         text: str,
         event: Any = None,
         initial_chain: list | None = None,
+        delivery_plan: dict | None = None,
     ) -> bool:
-        """发送主动消息（支持 TTS 与分段）。
+        """发送主动消息（支持 TTS、分段与气泡级发送计划）。
 
-        流程：可选 TTS 语音 -> 装饰钩子 -> 可选分段 -> 逐段发送 ->
-        发送后钩子。任一环节实际送出至少一条即视为成功。
+        流程：可选 TTS 语音 -> 装饰钩子 -> 气泡发送计划/可选分段 ->
+        逐条发送 -> 发送后钩子。任一环节实际送出至少一条即视为成功。
         """
         plugin = self.plugin
         session_config = plugin.config_service.get_session_config(session_id)
@@ -485,9 +485,28 @@ class SenderService:
         seg_conf = session_config.get("segmented_reply_settings", {})
         text = text or ""
 
-        # 可选语音发送：合成成功即作为一条消息链直接送出。
+        plan_bubbles: list[dict] = []
+        plan_use_chain = False
+        plan_voice = False
+        if isinstance(delivery_plan, dict):
+            raw_bubbles = delivery_plan.get("bubbles")
+            if isinstance(raw_bubbles, list):
+                plan_bubbles = [
+                    item
+                    for item in raw_bubbles
+                    if isinstance(item, dict)
+                    and str(item.get("text") or "").strip()
+                ]
+            plan_use_chain = bool(delivery_plan.get("use_chain"))
+            plan_voice = bool(delivery_plan.get("voice"))
+
+        # 可选语音发送：气泡计划开启时，语音只按计划概率触发。
         is_tts_sent = False
-        if tts_conf.get("enable_tts", True) and text.strip():
+        if (
+            tts_conf.get("enable_tts", True)
+            and text.strip()
+            and (delivery_plan is None or plan_voice)
+        ):
             try:
                 logger.info("[主动消息] 尝试进行手动TTS喵。")
                 tts_provider = plugin.context.get_using_tts_provider(umo=session_id)
@@ -517,76 +536,119 @@ class SenderService:
         should_send_text = not is_tts_sent or tts_conf.get("always_send_text", True)
 
         any_sent = is_tts_sent
+        segmented = False
+        send_chain: list = []
 
         if should_send_text:
-            base_components: list = list(initial_chain) if initial_chain else []
-
-            # 初始链未包含文本时，在开头补入纯文本段。
-            text_value = text.strip()
-            if text_value and not any(
-                isinstance(comp, Plain) for comp in base_components
-            ):
-                base_components.insert(0, Plain(text=text_value))
-
-            decorated_chain, should_send = await self.run_decorating_hooks(
-                event, base_components
-            )
-            if not should_send:
-                self._clear_event_result(event)
-                return False
-            if not decorated_chain:
-                logger.debug("[主动消息] 装饰后消息链为空，跳过文本发送喵。")
-
-            # 可选分段：分段后逐条发送，条目数与装饰后链不同即认为生效。
-            enable_seg = seg_conf.get("enable", False)
-            send_chain = decorated_chain
-            segmented = False
-            if enable_seg and decorated_chain:
-                send_chain = self.segment_decorated_chain(decorated_chain, seg_conf)
-                segmented = len(send_chain) != len(decorated_chain)
-
-            if decorated_chain:
-                if segmented:
-                    logger.info(
-                        f"[主动消息] 分段回复已启用，将发送 {len(send_chain)} 条消息喵。"
+            if plan_bubbles and not plan_use_chain:
+                # 气泡计划模式：按计划逐条发送，代替按标点的正则切分。
+                non_plain = [
+                    comp
+                    for comp in (initial_chain or [])
+                    if not isinstance(comp, Plain)
+                ]
+                for idx, bubble in enumerate(plan_bubbles):
+                    bubble_text = str(bubble.get("text") or "").strip()
+                    if not bubble_text:
+                        continue
+                    delay = float(bubble.get("delay_seconds", 0) or 0)
+                    if delay > 0:
+                        await asyncio.sleep(min(10.0, delay))
+                    decorated, should_send = await self.run_decorating_hooks(
+                        event, [Plain(text=bubble_text)]
                     )
+                    if not should_send:
+                        self._clear_event_result(event)
+                        return False
+                    if decorated and await self.send_chain(
+                        session_id, event, decorated
+                    ) is True:
+                        any_sent = True
+                    send_chain.append(Plain(text=bubble_text))
+                if non_plain:
+                    if await self.send_chain(session_id, event, non_plain) is True:
+                        any_sent = True
+                segmented = len(plan_bubbles) > 1
+                logger.info(
+                    f"[主动消息] 按发送计划送出 {len(plan_bubbles)} 条气泡"
+                    f"{'（含富媒体）' if non_plain else ''}喵。"
+                )
+            else:
+                base_components: list = list(initial_chain) if initial_chain else []
 
-                if segmented:
-                    for idx, comp in enumerate(send_chain):
-                        if await self.send_chain(session_id, event, [comp]) is True:
-                            any_sent = True
-                        if idx < len(send_chain) - 1:
-                            interval = await self.calc_interval(
-                                getattr(comp, "text", "") or "", seg_conf
-                            )
-                            logger.debug(
-                                f"[主动消息] 分段回复等待 {interval:.2f} 秒喵。"
-                            )
-                            await asyncio.sleep(interval)
-                elif await self.send_chain(session_id, event, send_chain) is True:
-                    any_sent = True
+                # 初始链未包含文本时，在开头补入纯文本段。
+                text_value = text.strip()
+                if text_value and not any(
+                    isinstance(comp, Plain) for comp in base_components
+                ):
+                    base_components.insert(0, Plain(text=text_value))
 
-                if plugin.telemetry and plugin.telemetry.enabled:
-                    plugin._track_task(
-                        asyncio.create_task(
-                            plugin.telemetry.track_feature(
-                                "message_send_result",
-                                {
-                                    "session_type": session_config.get(
-                                        "_session_type", "unknown"
-                                    ),
-                                    "tts_enabled": bool(
-                                        tts_conf.get("enable_tts", True)
-                                    ),
-                                    "tts_sent": is_tts_sent,
-                                    "segmented_enabled": segmented,
-                                    "segment_count": len(send_chain),
-                                    "text_length": len(text),
-                                    "success": any_sent,
-                                },
-                            )
+                decorated_chain, should_send = await self.run_decorating_hooks(
+                    event, base_components
+                )
+                if not should_send:
+                    self._clear_event_result(event)
+                    return False
+                if not decorated_chain:
+                    logger.debug("[主动消息] 装饰后消息链为空，跳过文本发送喵。")
+
+                # 兼容旧配置：未启用发送计划时仍按标点分段。
+                enable_seg = seg_conf.get("enable", False)
+                send_chain = decorated_chain
+                if enable_seg and decorated_chain:
+                    send_chain = self.segment_decorated_chain(
+                        decorated_chain, seg_conf
+                    )
+                    segmented = len(send_chain) != len(decorated_chain)
+
+                if decorated_chain:
+                    if segmented:
+                        logger.info(
+                            f"[主动消息] 分段回复已启用，将发送 {len(send_chain)} 条消息喵。"
+                        )
+
+                    if segmented:
+                        for idx, comp in enumerate(send_chain):
+                            if await self.send_chain(
+                                session_id, event, [comp]
+                            ) is True:
+                                any_sent = True
+                            if idx < len(send_chain) - 1:
+                                interval = await self.calc_interval(
+                                    getattr(comp, "text", "") or "", seg_conf
+                                )
+                                logger.debug(
+                                    f"[主动消息] 分段回复等待 {interval:.2f} 秒喵。"
+                                )
+                                await asyncio.sleep(interval)
+                    elif await self.send_chain(
+                        session_id, event, send_chain
+                    ) is True:
+                        any_sent = True
+
+            if plugin.telemetry and plugin.telemetry.enabled:
+                plugin._track_task(
+                    asyncio.create_task(
+                        plugin.telemetry.track_feature(
+                            "message_send_result",
+                            {
+                                "session_type": session_config.get(
+                                    "_session_type", "unknown"
+                                ),
+                                "tts_enabled": bool(
+                                    tts_conf.get("enable_tts", True)
+                                ),
+                                "tts_sent": is_tts_sent,
+                                "segmented_enabled": segmented,
+                                "segment_count": len(send_chain)
+                                or len(plan_bubbles),
+                                "planned_bubbles": len(plan_bubbles),
+                                "text_length": len(text),
+                                "success": any_sent,
+                            },
                         )
                     )
+                )
 
         if event is not None and EventType is not None:
             try:
@@ -602,10 +664,6 @@ class SenderService:
             )
             return False
 
-        # 群聊发送成功后重置沉默倒计时，等待下一轮静默再触发。
-        if is_group_umo(session_id):
-            await plugin.scheduler_service.reset_group_silence_timer(session_id)
-            logger.info(
-                f"[主动消息] Bot主动消息已发送，已重置 {plugin.session_service.get_session_log_str(session_id, session_config)} 的沉默倒计时喵。"
-            )
+        # 这段代码只处理私聊：发送成功后由 RECORD 阶段重新排期，
+        # 不存在群聊沉默倒计时需要重置。
         return True

@@ -1,6 +1,6 @@
-"""Web 控制台状态载荷构建。
+"""Web 控制台状态载荷构建（私聊版）。
 
-由旧 core/web_admin_server.py 的状态/任务/会话/Markdown 逻辑等价搬迁而来。
+只输出私聊会话、自动触发计时器与互动强度相关数据。
 """
 
 from __future__ import annotations
@@ -11,9 +11,17 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from ..services.scheduler_service import (
+    PAUSE_AT,
+    PAUSE_FLAG,
+    PAUSE_REASON,
+    PAUSE_THRESHOLD,
+    PAUSE_UNANSWERED,
+)
+
 
 class StateBuilder:
-    """构建运行状态、任务卡片、会话摘要与文档列表载荷。"""
+    """构建运行状态、任务卡片、会话摘要、强度面板与文档列表载荷。"""
 
     def __init__(
         self,
@@ -30,11 +38,7 @@ class StateBuilder:
     # 计时器元信息
     # ------------------------------------------------------------------
     def safe_timer_meta(self, timer: Any, now: float) -> dict[str, float | int | None]:
-        """安全读取 asyncio 计时器的剩余时间与绝对目标时间。
-
-        计时器可能已取消、已完成或实现不完整，统一用 None 表示“不可用”，
-        避免异常向上冒泡导致状态载荷构建失败。
-        """
+        """安全读取 asyncio 计时器的剩余时间与绝对目标时间。"""
         if timer is None:
             return {"remaining_seconds": None, "target_time": None}
 
@@ -65,40 +69,32 @@ class StateBuilder:
             return {"remaining_seconds": None, "target_time": None}
 
     def detect_session_category(self, session_id: str) -> str:
-        """判断会话属于群聊还是私聊，用于前端展示分类。"""
-        parsed = self.plugin.session_service.parse_session_id(session_id)
-        if not parsed:
-            lowered = str(session_id).lower()
-            return "group" if "group" in lowered else "friend"
+        """兼容旧前端字段：本插件所有会话都是私聊。"""
+        return "friend"
 
-        _, msg_type, _ = parsed
-        return "group" if "group" in msg_type.lower() else "friend"
+    def is_private_umo(self, session_id: str) -> bool:
+        try:
+            parsed = self.plugin.session_service.parse_session_id(session_id)
+        except Exception:
+            return True
+        if not parsed:
+            return True
+        return "friend" in str(parsed[1]).lower() or "private" in str(parsed[1]).lower()
 
     # ------------------------------------------------------------------
     # 计时器卡片
     # ------------------------------------------------------------------
     def collect_timer_cards(self, now: float) -> dict[str, list[dict[str, Any]]]:
-        """收集自动触发与群聊沉默两类计时器卡片。
-
-        群聊会话由沉默计时器驱动；若同一会话同时存在自动触发计时器，
-        则以群聊卡片为准去重，避免重复展示。
-        """
+        """收集私聊自动触发计时器卡片。"""
         plugin = self.plugin
         auto_cards: list[dict[str, Any]] = []
-        group_cards: list[dict[str, Any]] = []
-        # 记录已有群聊沉默计时器的会话，稍后据此过滤自动触发卡片。
-        active_group_sessions = {
-            str(session_id) for session_id in plugin.group_timers.keys()
-        }
 
         for session_id, timer in list(plugin.auto_trigger_timers.items()):
+            if not self.is_private_umo(str(session_id)):
+                continue
             normalized_session_id = plugin.session_service.normalize_session_id(
                 str(session_id)
             )
-            # 该会话已由群聊沉默计时器接管，跳过自动触发卡片。
-            if normalized_session_id in active_group_sessions:
-                continue
-
             session_config = plugin.config_service.get_session_config(session_id) or {}
             session_data = plugin.session_data.get(session_id, {})
             auto_settings = session_config.get("auto_trigger_settings", {})
@@ -113,13 +109,13 @@ class StateBuilder:
             target_time = timer_meta["target_time"]
             started_at = max(plugin.plugin_start_time, now - trigger_delay_seconds)
             progress_percent = 0
-            # 按“总窗口 - 剩余时间”估算已消耗进度，供前端进度条使用。
             if trigger_delay_seconds > 0 and remaining_seconds is not None:
                 consumed = max(0, trigger_delay_seconds - remaining_seconds)
                 progress_percent = max(
                     0, min(100, round((consumed / trigger_delay_seconds) * 100))
                 )
 
+            intensity = self._intensity_snapshot(normalized_session_id)
             auto_cards.append(
                 {
                     "session_id": normalized_session_id,
@@ -129,9 +125,7 @@ class StateBuilder:
                     "session_display_name": plugin.session_service.get_session_display_name(
                         normalized_session_id, session_config
                     ),
-                    "session_category": self.detect_session_category(
-                        normalized_session_id
-                    ),
+                    "session_category": "friend",
                     "source_mode": context_settings.get(
                         "source_mode", "conversation_history"
                     ),
@@ -148,71 +142,12 @@ class StateBuilder:
                     "progress_percent": progress_percent,
                     "unanswered_count": session_data.get("unanswered_count", 0),
                     "auto_trigger_after_minutes": trigger_delay_minutes,
-                }
-            )
-
-        # 群聊沉默计时器卡片（以用户最后发言时间为起点）。
-        for session_id, timer in list(plugin.group_timers.items()):
-            normalized_session_id = plugin.session_service.normalize_session_id(
-                str(session_id)
-            )
-            session_config = (
-                plugin.config_service.get_session_config(normalized_session_id) or {}
-            )
-            session_data = plugin.session_data.get(normalized_session_id, {})
-            schedule_settings = session_config.get("schedule_settings", {})
-            context_settings = session_config.get("context_settings", {})
-            idle_minutes = int(session_config.get("group_idle_trigger_minutes", 0) or 0)
-            idle_seconds = max(0, idle_minutes * 60)
-            timer_meta = self.safe_timer_meta(timer, now)
-            remaining_seconds = timer_meta["remaining_seconds"]
-            target_time = timer_meta["target_time"]
-            last_message_time = plugin.last_message_times.get(normalized_session_id, 0)
-            temp_state = plugin.session_temp_state.get(normalized_session_id, {})
-            last_user_time = (
-                temp_state.get("last_user_time") or last_message_time or None
-            )
-            started_at = last_user_time or (
-                now - max(0, idle_seconds - (remaining_seconds or 0))
-            )
-            progress_percent = 0
-            if idle_seconds > 0 and remaining_seconds is not None:
-                consumed = max(0, idle_seconds - remaining_seconds)
-                progress_percent = max(
-                    0, min(100, round((consumed / idle_seconds) * 100))
-                )
-
-            group_cards.append(
-                {
-                    "session_id": normalized_session_id,
-                    "session_name": plugin.session_service.get_session_name(
-                        normalized_session_id, session_config
+                    "intensity_score": intensity.get("score"),
+                    "intensity_tier": intensity.get("tier"),
+                    "intensity_tier_label": intensity.get("tier_label"),
+                    "intensity_probability_percent": intensity.get(
+                        "probability_percent"
                     ),
-                    "session_display_name": plugin.session_service.get_session_display_name(
-                        normalized_session_id, session_config
-                    ),
-                    "session_category": self.detect_session_category(
-                        normalized_session_id
-                    ),
-                    "source_mode": context_settings.get(
-                        "source_mode", "platform_message_history"
-                    ),
-                    "max_unanswered_times": schedule_settings.get(
-                        "max_unanswered_times", 0
-                    ),
-                    "timer_kind": "group_silence",
-                    "title": "群沉默检测",
-                    "status": "running" if remaining_seconds is not None else "unknown",
-                    "remaining_seconds": remaining_seconds,
-                    "target_time": target_time,
-                    "started_at": started_at if started_at else None,
-                    "window_seconds": idle_seconds,
-                    "progress_percent": progress_percent,
-                    "unanswered_count": session_data.get("unanswered_count", 0),
-                    "group_idle_trigger_minutes": idle_minutes,
-                    "last_message_time": last_message_time or None,
-                    "last_user_time": last_user_time,
-                    "is_live_group_timer": True,
                 }
             )
 
@@ -223,20 +158,96 @@ class StateBuilder:
                 item["session_id"],
             )
         )
-        group_cards.sort(
-            key=lambda item: (
-                item.get("remaining_seconds") is None,
-                item.get("remaining_seconds") or 0,
-                item["session_id"],
+        return {"auto_trigger_cards": auto_cards}
+
+    def _intensity_snapshot(self, session_id: str) -> dict[str, Any]:
+        service = getattr(self.plugin, "intensity_service", None)
+        if service is None:
+            return {}
+        try:
+            return service.evaluate(session_id)
+        except Exception:
+            return {}
+
+    def _memory_status(self) -> dict[str, Any]:
+        bridge = getattr(self.plugin, "memory_bridge", None)
+        if bridge is None:
+            return {}
+        try:
+            return bridge.status()
+        except Exception:
+            return {}
+
+    def collect_paused_sessions(self) -> list[dict[str, Any]]:
+        """列出因连续未回复而暂停的私聊会话。"""
+        plugin = self.plugin
+        results: list[dict[str, Any]] = []
+        for session_id in self.list_known_sessions():
+            info = plugin.session_data.get(session_id)
+            if not isinstance(info, dict) or not info.get(PAUSE_FLAG):
+                continue
+
+            session_config = (
+                plugin.config_service.get_session_config(session_id) or {}
             )
-        )
-        return {
-            "auto_trigger_cards": auto_cards,
-            "group_timer_cards": group_cards,
-        }
+            intensity = self._intensity_snapshot(session_id)
+            paused_at = info.get(PAUSE_AT)
+            pause_reason = str(info.get(PAUSE_REASON) or "")
+            results.append(
+                {
+                    "session_id": session_id,
+                    "session_name": plugin.session_service.get_session_name(
+                        session_id, session_config
+                    ),
+                    "session_display_name": plugin.session_service.get_session_display_name(
+                        session_id, session_config
+                    ),
+                    "enabled": bool(session_config.get("enable", False)),
+                    "paused_at": (
+                        datetime.fromtimestamp(
+                            float(paused_at), tz=getattr(plugin, "timezone", None)
+                        ).isoformat()
+                        if isinstance(paused_at, (int, float))
+                        else None
+                    ),
+                    "pause_reason": pause_reason,
+                    "pause_reason_label": (
+                        "用户明确表示不想收到主动消息"
+                        if pause_reason == "negative_feedback"
+                        else "连续未回复"
+                    ),
+                    "cooldown_until": info.get("cooldown_until"),
+                    "cooldown_remaining_seconds": (
+                        int(
+                            plugin.scheduler_service.cooldown_remaining(session_id)
+                        )
+                        if hasattr(plugin.scheduler_service, "cooldown_remaining")
+                        else 0
+                    ),
+                    "last_reply_quality": intensity.get("last_reply_quality"),
+                    "conversation_state_label": (
+                        intensity.get("conversation_state") or {}
+                    ).get("state_label"),
+                    "paused_unanswered_count": int(
+                        info.get(PAUSE_UNANSWERED, 0) or 0
+                    ),
+                    "paused_threshold": int(info.get(PAUSE_THRESHOLD, 0) or 0),
+                    "unanswered_count": int(info.get("unanswered_count", 0) or 0),
+                    "last_topic_judge": info.get("last_topic_judge") or {},
+                    "intensity_score": intensity.get("score"),
+                    "intensity_tier": intensity.get("tier"),
+                    "intensity_tier_label": intensity.get("tier_label"),
+                    "intensity_probability_percent": intensity.get(
+                        "probability_percent"
+                    ),
+                }
+            )
+
+        results.sort(key=lambda item: str(item.get("paused_at") or ""), reverse=True)
+        return results
 
     # ------------------------------------------------------------------
-    # 状态载荷
+    # 通知与状态
     # ------------------------------------------------------------------
     async def build_notification_payload(self) -> dict[str, Any]:
         """构建通知载荷（通知中心不可用时返回空结构）。"""
@@ -252,12 +263,22 @@ class StateBuilder:
             }
         return await notification_center.get_payload()
 
+    def build_intensity_summary(self) -> dict[str, Any]:
+        service = getattr(self.plugin, "intensity_service", None)
+        if service is None:
+            return {}
+        try:
+            return service.summary(self.list_known_sessions())
+        except Exception:
+            return {}
+
     def build_status_payload(self) -> dict[str, Any]:
-        """构建运行状态载荷（版本、运行时长、任务计数与计时器卡片）。"""
+        """构建运行状态载荷（版本、运行时长、任务计数、计时器与强度概览）。"""
         plugin = self.plugin
         now = time.time()
         uptime_sec = max(0, int(now - plugin.plugin_start_time))
         timer_cards = self.collect_timer_cards(now)
+        paused_sessions = self.collect_paused_sessions()
 
         return {
             "running": True,
@@ -271,21 +292,24 @@ class StateBuilder:
                 - datetime.fromtimestamp(plugin.plugin_start_time)
             ),
             "scheduler_running": bool(plugin.scheduler and plugin.scheduler.running),
-            "sessions_count": len(plugin.session_data),
+            "sessions_count": len(self.list_known_sessions()),
             "auto_trigger_timers": len(plugin.auto_trigger_timers),
-            "group_timers": len(plugin.group_timers),
             "jobs_count": len(plugin.scheduler.get_jobs()) if plugin.scheduler else 0,
-            "timer_cards_total": len(timer_cards["auto_trigger_cards"])
-            + len(timer_cards["group_timer_cards"]),
+            "timer_cards_total": len(timer_cards["auto_trigger_cards"]),
             "auto_trigger_cards": timer_cards["auto_trigger_cards"],
-            "group_timer_cards": timer_cards["group_timer_cards"],
+            "paused_count": len(paused_sessions),
+            "paused_sessions": paused_sessions,
+            "intensity_summary": self.build_intensity_summary(),
+            "memory_status": self._memory_status(),
             "ws_connections": self._connection_counter(),
-            # 时间戳用于前端判断数据新鲜度或手动刷新完成时间。
             "timestamp": datetime.now().isoformat(),
         }
 
+    # ------------------------------------------------------------------
+    # 任务与会话
+    # ------------------------------------------------------------------
     def collect_jobs(self) -> list[dict[str, Any]]:
-        """收集 APScheduler 中已注册的主动消息任务摘要。"""
+        """收集 APScheduler 中已注册的私聊主动消息任务摘要。"""
         plugin = self.plugin
         if not plugin.scheduler:
             return []
@@ -293,11 +317,18 @@ class StateBuilder:
         jobs = []
         for job in plugin.scheduler.get_jobs():
             session_id = str(job.id)
+            if not self.is_private_umo(session_id):
+                continue
             session_data = plugin.session_data.get(session_id, {})
             session_config = plugin.config_service.get_session_config(session_id) or {}
             schedule_settings = session_config.get("schedule_settings", {})
             context_settings = session_config.get("context_settings", {})
             auto_trigger_settings = session_config.get("auto_trigger_settings", {})
+            intensity = self._intensity_snapshot(session_id)
+            conversation_state = intensity.get("conversation_state") or {}
+            rhythm = intensity.get("rhythm") or {}
+            persona = intensity.get("persona") or {}
+            conversation_memory = intensity.get("conversation_memory") or {}
             jobs.append(
                 {
                     "id": session_id,
@@ -307,7 +338,7 @@ class StateBuilder:
                     "session_display_name": plugin.session_service.get_session_display_name(
                         session_id, session_config
                     ),
-                    "session_category": self.detect_session_category(session_id),
+                    "session_category": "friend",
                     "source_mode": context_settings.get(
                         "source_mode", "conversation_history"
                     ),
@@ -332,6 +363,9 @@ class StateBuilder:
                     "last_schedule_random_interval_seconds": session_data.get(
                         "last_schedule_random_interval_seconds"
                     ),
+                    "last_schedule_intensity_score": session_data.get(
+                        "last_schedule_intensity_score"
+                    ),
                     "schedule_min_interval_minutes": schedule_settings.get(
                         "min_interval_minutes"
                     ),
@@ -339,31 +373,66 @@ class StateBuilder:
                         "max_interval_minutes"
                     ),
                     "quiet_hours": schedule_settings.get("quiet_hours", ""),
+                    "intensity_score": intensity.get("score"),
+                    "intensity_tier": intensity.get("tier"),
+                    "intensity_tier_label": intensity.get("tier_label"),
+                    "intensity_probability_percent": intensity.get(
+                        "probability_percent"
+                    ),
+                    "intensity_effective_interval_minutes": intensity.get(
+                        "effective_interval_minutes"
+                    ),
+                    "conversation_state": conversation_state.get("state"),
+                    "conversation_state_label": conversation_state.get(
+                        "state_label"
+                    ),
+                    "last_intent": conversation_state.get("last_intent"),
+                    "last_intent_label": conversation_state.get(
+                        "last_intent_label"
+                    ),
+                    "last_reply_quality": intensity.get("last_reply_quality"),
+                    "persona_mood_label": persona.get("mood_label"),
+                    "persona_energy_percent": persona.get("energy_percent"),
+                    "rhythm_active_hours_label": rhythm.get(
+                        "active_hours_label"
+                    ),
+                    "rhythm_daily_count": rhythm.get("daily_count"),
+                    "rhythm_daily_limit": rhythm.get("daily_limit"),
+                    "open_loop_count": conversation_memory.get("open_loop_count", 0),
+                    "profile_summary": conversation_memory.get("profile_summary", ""),
                 }
             )
         return jobs
 
     def list_known_sessions(self) -> list[str]:
-        """汇总配置、会话数据与差异配置中出现过的所有会话标识。"""
+        """汇总私聊配置、会话数据与差异配置中出现过的所有私聊会话。"""
         plugin = self.plugin
         sessions: set[str] = set()
 
-        for scope_key in ("friend_settings", "group_settings"):
-            cfg = plugin.config.get(scope_key, {})
-            for session in cfg.get("session_list", []):
-                if isinstance(session, str) and session:
-                    sessions.add(plugin.session_service.normalize_session_id(session))
+        private_settings = plugin.config_service.get_private_settings()
+        for session in private_settings.get("session_list", []) or []:
+            if isinstance(session, str) and session:
+                normalized = plugin.session_service.normalize_session_id(session)
+                if self.is_private_umo(normalized):
+                    sessions.add(normalized)
 
-        sessions.update(plugin.session_data.keys())
-        sessions.update(plugin.session_override_manager.list_sessions())
+        for session in plugin.session_data.keys():
+            if self.is_private_umo(session):
+                sessions.add(session)
+
+        for session in plugin.session_override_manager.list_sessions():
+            if self.is_private_umo(session):
+                sessions.add(session)
+
         return sorted(sessions)
 
     def list_known_session_summaries(self) -> list[dict[str, Any]]:
-        """返回带展示信息的已知会话摘要（供 WS 实时推送使用）。"""
+        """返回带展示信息与强度摘要的已知私聊会话。"""
         plugin = self.plugin
         result: list[dict[str, Any]] = []
         for session in self.list_known_sessions():
             effective = plugin.config_service.get_session_config(session)
+            intensity = self._intensity_snapshot(session)
             result.append(
                 {
                     "session": session,
@@ -381,46 +450,77 @@ class StateBuilder:
                     ),
                     "manual_trigger_in_progress": session
                     in plugin.manual_trigger_sessions,
+                    "paused": bool(
+                        (plugin.session_data.get(session) or {}).get(PAUSE_FLAG)
+                    ),
+                    "paused_at": (plugin.session_data.get(session) or {}).get(
+                        PAUSE_AT
+                    ),
+                    "paused_unanswered_count": int(
+                        (plugin.session_data.get(session) or {}).get(
+                            PAUSE_UNANSWERED, 0
+                        )
+                        or 0
+                    ),
+                    "intensity_score": intensity.get("score"),
+                    "intensity_tier": intensity.get("tier"),
+                    "intensity_tier_label": intensity.get("tier_label"),
+                    "intensity_probability_percent": intensity.get(
+                        "probability_percent"
+                    ),
+                    "conversation_state_label": (
+                        intensity.get("conversation_state") or {}
+                    ).get("state_label"),
+                    "last_intent_label": (
+                        intensity.get("conversation_state") or {}
+                    ).get("last_intent_label"),
+                    "last_reply_quality": intensity.get("last_reply_quality"),
                 }
             )
         return result
+
+    def collect_intensity_sessions(self) -> list[dict[str, Any]]:
+        """构建互动强度面板数据。"""
+        service = getattr(self.plugin, "intensity_service", None)
+        if service is None:
+            return []
+
+        snapshots = service.collect_snapshots(self.list_known_sessions())
+        for item in snapshots:
+            session_id = item.get("session_id", "")
+            session_config = (
+                self.plugin.config_service.get_session_config(session_id) or {}
+            )
+            item["enabled"] = bool(session_config.get("enable", False))
+        return snapshots
 
     # ------------------------------------------------------------------
     # Markdown 文档
     # ------------------------------------------------------------------
     def list_markdown_documents(self) -> list[dict[str, Any]]:
-        """列出允许浏览的 Markdown 文档摘要。
-
-        仅扫描插件根目录下的顶层 *.md 与 docs/ 目录，避免越权读取。
-        """
+        """列出允许浏览的 Markdown 文档摘要。"""
         items: list[dict[str, Any]] = []
         seen: set[str] = set()
         plugin_root = Path(__file__).resolve().parents[2].resolve()
         docs_root = (plugin_root / "docs").resolve()
 
-        # 允许浏览的文档集合：根目录同级的 Markdown 与 docs/ 下全部 Markdown。
         allowed_paths: list[Path] = []
-
         if plugin_root.exists():
             allowed_paths.extend(sorted(plugin_root.glob("*.md")))
-
         if docs_root.exists():
             allowed_paths.extend(sorted(docs_root.rglob("*.md")))
 
         for path in allowed_paths:
             if not path.is_file():
                 continue
-
             try:
                 relative_path = self.to_workspace_relative_path(path)
             except ValueError:
                 continue
-
             normalized = relative_path.replace("\\", "/")
             if normalized in seen:
                 continue
             seen.add(normalized)
-
             items.append(
                 {
                     "path": normalized,
@@ -443,10 +543,8 @@ class StateBuilder:
     def resolve_markdown_document(self, raw_path: str) -> Path | None:
         """将前端请求的 Markdown 相对路径解析为插件目录中的受信任文件。"""
         normalized = str(raw_path or "").strip().replace("\\", "/")
-        # 仅接受以 .md 结尾的相对路径。
         if not normalized or not normalized.lower().endswith(".md"):
             return None
-        # 拒绝绝对路径与包含 .. 的路径穿越尝试。
         if (
             normalized.startswith("/")
             or normalized.startswith("../")

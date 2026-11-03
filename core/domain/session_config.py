@@ -10,15 +10,14 @@ from dataclasses import dataclass, field
 from typing import Any
 
 # 一级配置块名称（与 _conf_schema.json 完全一致）
-FRIEND_SETTINGS_KEY = "friend_settings"
-GROUP_SETTINGS_KEY = "group_settings"
+PRIVATE_SETTINGS_KEY = "private_settings"
+LEGACY_FRIEND_SETTINGS_KEY = "friend_settings"
 WEB_ADMIN_KEY = "web_admin"
 NOTIFICATION_SETTINGS_KEY = "notification_settings"
 TELEMETRY_CONFIG_KEY = "telemetry_config"
 
-# 会话类型标签
+# 本插件只服务私聊。
 SESSION_TYPE_FRIEND = "friend"
-SESSION_TYPE_GROUP = "group"
 
 
 @dataclass
@@ -27,7 +26,7 @@ class SessionConfig:
 
     Attributes:
         raw: 合并 base + override 后的原始 dict，保持与旧实现完全一致的结构。
-        session_type: friend 或 group。
+        session_type: 固定为 friend（仅私聊）。
         from_session_list: 是否命中全局 session_list。
         has_override: 是否存在会话级覆写。
     """

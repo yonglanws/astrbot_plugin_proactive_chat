@@ -1,0 +1,411 @@
+/*
+ * 文件职责：AstrBot 插件页面（views/proactive-chat）样式适配层。
+ *
+ * 独立管理端使用 MD3 紫色主题；作为 AstrBot Page 运行时应跟随 Dashboard
+ * 的蓝色主题、卡片与排版。这里只覆盖设计令牌和页面外壳，不改动各业务视图
+ * 的内部结构，保证两种运行方式共用同一份代码。
+ */
+
+html.embedded-page body {
+    --md-sys-color-primary: #3c96ca;
+    --md-sys-color-on-primary: #ffffff;
+    --md-sys-color-primary-container: #e8f3fa;
+    --md-sys-color-on-primary-container: #0d3b56;
+
+    --md-sys-color-secondary: #2f86bd;
+    --md-sys-color-on-secondary: #ffffff;
+    --md-sys-color-secondary-container: #eef2f6;
+    --md-sys-color-on-secondary-container: #16384d;
+
+    --md-sys-color-surface: #ffffff;
+    --md-sys-color-on-surface: #1b1c1d;
+    --md-sys-color-on-surface-variant: rgba(0, 0, 0, 0.66);
+    --md-sys-color-surface-variant: #eef2f6;
+
+    --md-sys-color-background: #ffffff;
+    --md-sys-color-error: #f44336;
+    --md-sys-color-success: #00a846;
+    --md-sys-color-warning: #b7791f;
+
+    --md-primary-rgb: 60 150 202;
+    --md-error-rgb: 244 67 54;
+    --md-success-rgb: 0 168 70;
+    --md-warning-rgb: 183 121 31;
+
+    --glass-bg: #ffffff;
+    --glass-border: rgba(0, 0, 0, 0.1);
+    --glass-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+    --md-switch-track: rgba(0, 0, 0, 0.12);
+    --md-menu-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+    --md-elevation-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+
+    --radius-sm: 6px;
+    --radius-md: 8px;
+    --radius-lg: 16px;
+    --radius-xl: 24px;
+    --top-bar-height: 0px;
+}
+
+html.embedded-page.theme-dark body,
+html.embedded-page[data-theme="dark"] body {
+    --md-sys-color-primary: #5ba4d4;
+    --md-sys-color-on-primary: #082333;
+    --md-sys-color-primary-container: #1a2e3d;
+    --md-sys-color-on-primary-container: #d7ecf8;
+
+    --md-sys-color-secondary: #4a95c4;
+    --md-sys-color-on-secondary: #082333;
+    --md-sys-color-secondary-container: #1a2e3d;
+    --md-sys-color-on-secondary-container: #d7ecf8;
+
+    --md-sys-color-surface: #242424;
+    --md-sys-color-on-surface: #e8eaed;
+    --md-sys-color-on-surface-variant: rgba(255, 255, 255, 0.72);
+    --md-sys-color-surface-variant: #2f2f2f;
+
+    --md-sys-color-background: #1a1a1a;
+    --md-sys-color-error: #ff4d4f;
+    --md-sys-color-success: #52c41a;
+    --md-sys-color-warning: #faad14;
+
+    --md-primary-rgb: 91 164 212;
+    --md-error-rgb: 255 77 79;
+    --md-success-rgb: 82 196 26;
+    --md-warning-rgb: 250 173 20;
+
+    --glass-bg: #242424;
+    --glass-border: rgba(255, 255, 255, 0.14);
+    --glass-shadow: 0 1px 2px rgba(0, 0, 0, 0.24);
+    --md-switch-track: rgba(255, 255, 255, 0.16);
+    --md-menu-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+    --md-elevation-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+}
+
+html.embedded-page,
+html.embedded-page body {
+    height: 100%;
+    margin: 0;
+    background: var(--md-sys-color-background);
+}
+
+html.embedded-page #root {
+    height: 100%;
+}
+
+html.embedded-page body {
+    color: var(--md-sys-color-on-surface);
+    font-family: "Outfit", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+    -webkit-font-smoothing: antialiased;
+}
+
+/* 页面外壳 */
+.embedded-page-shell {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    min-height: 0;
+    background: var(--md-sys-color-background);
+}
+
+.astrbot-page-header {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 24px;
+    padding: 22px 28px 16px;
+    border-bottom: 1px solid var(--glass-border);
+    background: var(--md-sys-color-background);
+}
+
+.astrbot-page-heading {
+    min-width: 0;
+}
+
+.astrbot-page-eyebrow {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 6px;
+    color: var(--md-sys-color-on-surface-variant);
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+}
+
+.astrbot-page-logo {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    border-radius: 8px;
+    background: var(--md-sys-color-primary-container);
+    color: var(--md-sys-color-on-primary-container);
+    font-size: 13px;
+}
+
+.astrbot-page-title {
+    margin: 0 !important;
+    color: var(--md-sys-color-on-surface);
+    font-size: 1.5rem !important;
+    font-weight: 700 !important;
+    line-height: 1.2 !important;
+    letter-spacing: -0.02em;
+}
+
+.astrbot-page-subtitle {
+    margin: 5px 0 0 !important;
+    max-width: 760px;
+    color: var(--md-sys-color-on-surface-variant);
+    font-size: 0.875rem !important;
+    line-height: 1.6 !important;
+}
+
+.astrbot-page-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+}
+
+.astrbot-page-live-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    height: 34px;
+    padding: 0 12px;
+    border: 1px solid var(--glass-border);
+    border-radius: 999px;
+    background: var(--md-sys-color-surface);
+    color: var(--md-sys-color-on-surface-variant);
+    font-size: 12px;
+    font-weight: 500;
+    white-space: nowrap;
+}
+
+.astrbot-page-live-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--md-sys-color-success);
+    box-shadow: 0 0 0 3px rgb(var(--md-success-rgb) / 0.14);
+}
+
+.astrbot-page-refresh,
+.astrbot-page-theme {
+    height: 34px;
+    border: 1px solid var(--glass-border);
+    border-radius: 999px;
+    background: var(--md-sys-color-surface);
+    color: var(--md-sys-color-on-surface);
+    font: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background-color 160ms ease, border-color 160ms ease, opacity 160ms ease;
+}
+
+.astrbot-page-refresh {
+    padding: 0 16px;
+}
+
+.astrbot-page-theme {
+    width: 34px;
+    font-size: 15px;
+}
+
+.astrbot-page-refresh:hover,
+.astrbot-page-theme:hover {
+    background: var(--md-sys-color-surface-variant);
+    border-color: rgb(var(--md-primary-rgb) / 0.34);
+}
+
+.astrbot-page-refresh:disabled {
+    opacity: 0.6;
+    cursor: default;
+}
+
+/* 页签：贴近 AstrBot 页面顶部 tabs 的轻量样式 */
+.astrbot-page-tabs {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 0 22px;
+    border-bottom: 1px solid var(--glass-border);
+    background: var(--md-sys-color-background);
+    overflow-x: auto;
+    scrollbar-width: none;
+}
+
+.astrbot-page-tabs::-webkit-scrollbar {
+    display: none;
+}
+
+.astrbot-page-tab {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    flex: 0 0 auto;
+    height: 46px;
+    padding: 0 12px;
+    border: 0;
+    border-bottom: 2px solid transparent;
+    background: transparent;
+    color: var(--md-sys-color-on-surface-variant);
+    font: inherit;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: color 160ms ease, border-color 160ms ease, background-color 160ms ease;
+}
+
+.astrbot-page-tab:hover {
+    color: var(--md-sys-color-on-surface);
+    background: rgb(var(--md-primary-rgb) / 0.05);
+}
+
+.astrbot-page-tab.is-active {
+    color: var(--md-sys-color-primary);
+    border-bottom-color: var(--md-sys-color-primary);
+    font-weight: 600;
+}
+
+.astrbot-page-tab-icon {
+    font-size: 14px;
+    line-height: 1;
+}
+
+.astrbot-page-tab-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 18px;
+    height: 18px;
+    padding: 0 5px;
+    border-radius: 999px;
+    background: var(--md-sys-color-error);
+    color: #fff;
+    font-size: 10px;
+    font-weight: 700;
+    line-height: 1;
+}
+
+/* 内容区 */
+.astrbot-page-content {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 20px 28px 34px;
+    box-sizing: border-box;
+}
+
+/* AstrBot 的卡片是扁平表面 + 细边框，不使用玻璃模糊与紫色阴影。 */
+html.embedded-page .card {
+    background: var(--md-sys-color-surface);
+    border: 1px solid var(--glass-border);
+    border-radius: 16px;
+    box-shadow: none;
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+}
+
+html.embedded-page .card:hover {
+    transform: none;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.05);
+}
+
+html.embedded-page.theme-dark .card:hover {
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.3);
+}
+
+/* 页签切换时的滚动位置由 useScrollRestore 接管，容器本身保持稳定。 */
+@media (max-width: 900px) {
+    .astrbot-page-header {
+        align-items: flex-start;
+        flex-direction: column;
+        gap: 14px;
+        padding: 18px 18px 14px;
+    }
+
+    .astrbot-page-actions {
+        width: 100%;
+        justify-content: flex-start;
+    }
+
+    .astrbot-page-tabs {
+        padding: 0 12px;
+    }
+
+    .astrbot-page-content {
+        padding: 16px 18px 28px;
+    }
+}
+
+/* 页面内确认/提示对话框：替代被 sandbox 禁用的 window.alert/confirm。 */
+.proactive-dialog-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 10000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    background: rgba(15, 23, 32, 0.42);
+    backdrop-filter: blur(2px);
+}
+
+.proactive-dialog {
+    width: min(420px, 100%);
+    padding: 22px;
+    border: 1px solid var(--glass-border);
+    border-radius: 16px;
+    background: var(--md-sys-color-surface);
+    color: var(--md-sys-color-on-surface);
+    box-shadow: 0 18px 48px rgba(0, 0, 0, 0.24);
+}
+
+.proactive-dialog-message {
+    white-space: pre-wrap;
+    font-size: 14px;
+    line-height: 1.7;
+}
+
+.proactive-dialog-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 10px;
+    margin-top: 20px;
+}
+
+.proactive-dialog-button {
+    min-width: 84px;
+    padding: 9px 16px;
+    border: 1px solid var(--glass-border);
+    border-radius: 999px;
+    background: var(--md-sys-color-surface);
+    color: var(--md-sys-color-on-surface);
+    font-size: 13px;
+}
+
+.proactive-dialog-button.is-primary {
+    border-color: transparent;
+    background: var(--md-sys-color-primary);
+    color: var(--md-sys-color-on-primary);
+}
+
+/* AstrBot 页面更紧凑：指标从卡片顶部排列，避免大块留白。 */
+html.embedded-page .status-panel-card {
+    min-height: 240px;
+}
+
+html.embedded-page .status-metric-list,
+html.embedded-page .status-actions-list {
+    justify-content: flex-start;
+    padding-top: 6px;
+}
+
+html.embedded-page .status-panel-icon-purple {
+    background: rgb(var(--md-primary-rgb) / 0.12);
+}

@@ -15,9 +15,11 @@ class HookPoint(Enum):
     GATE = "gate"  # 是否允许本轮（启用/免打扰/未回复上限）
     INTENT = "intent"  # 是否真的发言（可由模型自主决定）
     CONTEXT = "context"  # 汇总上下文来源
+    PLAN = "plan"  # 多阶段生成的规划（可选）
     PROMPT = "prompt"  # 拼装提示词
     DELIBERATE = "deliberate"  # 调用 LLM（可含链式工具调用/富媒体）
     REVIEW = "review"  # 生成后复核（新消息检测等）
+    GUARD = "guard"  # 发送前自然度守卫（重复/长度/语气）
     DELIVER = "deliver"  # 发送（装饰/分段/TTS）
     RECORD = "record"  # 存档与计数
     SCHEDULE = "schedule"  # 安排下一次
@@ -28,7 +30,6 @@ class TriggerSource(Enum):
 
     SCHEDULE = "schedule"  # 持久化定时任务（私聊）
     AUTO_TRIGGER = "auto_trigger"  # 插件启动后的自动触发
-    GROUP_IDLE = "group_idle"  # 群聊沉默倒计时
     MANUAL = "manual"  # Web 管理端手动立即触发
 
 

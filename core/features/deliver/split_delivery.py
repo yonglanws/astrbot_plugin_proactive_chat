@@ -33,6 +33,7 @@ class DeliverStage(BaseStage):
                 extra.get("response_text", ""),
                 event=ctx.event,
                 initial_chain=extra.get("result_chain"),
+                delivery_plan=extra.get("delivery_plan"),
             )
             is True
         )

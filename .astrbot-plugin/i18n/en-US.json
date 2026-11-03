@@ -1,0 +1,8 @@
+{
+  "views": {
+    "proactive-chat": {
+      "title": "Proactive Chat Console",
+      "description": "Inspect runtime status, interaction intensity, schedules, and private-chat settings."
+    }
+  }
+}

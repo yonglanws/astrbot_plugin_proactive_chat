@@ -459,27 +459,24 @@ class TelemetryManager:
             # 深拷贝后再修改，避免遥测过滤逻辑意外污染插件运行中的真实配置对象。
             config_copy = copy.deepcopy(config)
 
-            friend_settings = config_copy.get("friend_settings")
-            if isinstance(friend_settings, dict):
+            # 兼容旧键：private_settings 与 friend_settings 都要脱敏。
+            for settings_key in ("private_settings", "friend_settings"):
+                settings = config_copy.get(settings_key)
+                if not isinstance(settings, dict):
+                    continue
                 # 私聊会话列表不上传原文，只保留数量用于统计默认值设计是否合理。
-                session_list = friend_settings.pop("session_list", [])
-                friend_settings["session_list_count"] = (
+                session_list = settings.pop("session_list", [])
+                settings["session_list_count"] = (
                     len(session_list) if isinstance(session_list, list) else 0
                 )
                 # 私聊主动提示词正文属于高敏感内容，必须完全移除。
-                if "proactive_prompt" in friend_settings:
-                    del friend_settings["proactive_prompt"]
+                if "proactive_prompt" in settings:
+                    del settings["proactive_prompt"]
 
-            group_settings = config_copy.get("group_settings")
-            if isinstance(group_settings, dict):
-                # 群聊会话列表同样只统计数量，不上传任何具体 UMO。
-                session_list = group_settings.pop("session_list", [])
-                group_settings["session_list_count"] = (
-                    len(session_list) if isinstance(session_list, list) else 0
-                )
-                # 群聊提示词也做整段过滤，避免活跃策略被直接暴露。
-                if "proactive_prompt" in group_settings:
-                    del group_settings["proactive_prompt"]
+            # 群聊配置已废弃；即使旧配置文件中仍存在，也不进入遥测。
+            for key in list(config_copy.keys()):
+                if "group" in str(key).lower():
+                    del config_copy[key]
 
             web_admin = config_copy.get("web_admin")
             if isinstance(web_admin, dict) and "password" in web_admin:

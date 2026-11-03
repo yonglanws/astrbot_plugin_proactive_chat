@@ -1,7 +1,8 @@
 # 本插件的核心依赖大多已包含在 AstrBot 的默认依赖中，且在插件下载安装时会自动安装插件所需的依赖，通常无需额外安装。
 # 此文件主要用于明确声明依赖，以备不时之需。
-apscheduler>=3.11.3,<4.0
-aiofiles>=25.1.0
-fastapi>=0.142.2
-uvicorn>=0.54.0
-tomli>=2.4.1,<3.0 ; python_version < "3.11"
+# 注意：这些库 AstrBot Core 也依赖，因此只声明兼容范围，不与 Core 的固定版本冲突。
+apscheduler>=3.10,<4.0
+aiofiles>=23.0
+fastapi>=0.110,<1.0
+uvicorn>=0.24,<1.0
+tomli>=2.0,<3.0 ; python_version < "3.11"

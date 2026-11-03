@@ -5,9 +5,16 @@
 """
 
 from .domain_enums import HookPoint, StageResult, TriggerSource
+from .intensity import (
+    IntensityResult,
+    IntensitySettings,
+    IntensitySignals,
+    compute_score,
+    effective_interval_range,
+    probability_for_score,
+)
 from .session_key import (
     SessionKey,
-    contains_group_marker,
     is_friend_type,
     is_group_type,
     is_group_umo,
@@ -18,7 +25,12 @@ __all__ = [
     "StageResult",
     "TriggerSource",
     "SessionKey",
-    "contains_group_marker",
+    "IntensityResult",
+    "IntensitySettings",
+    "IntensitySignals",
+    "compute_score",
+    "effective_interval_range",
+    "probability_for_score",
     "is_friend_type",
     "is_group_type",
     "is_group_umo",

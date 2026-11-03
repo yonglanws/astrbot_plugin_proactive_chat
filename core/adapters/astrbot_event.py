@@ -12,11 +12,11 @@ from typing import Any
 
 from astrbot.api import logger
 from astrbot.core.message.message_event_result import MessageChain
-from astrbot.core.platform.astrbot_message import AstrBotMessage, Group, MessageMember
+from astrbot.core.platform.astrbot_message import AstrBotMessage, MessageMember
 from astrbot.core.platform.message_type import MessageType
 from astrbot.core.platform.platform import PlatformStatus
 
-from ..domain.session_key import SessionKey, is_group_umo
+from ..domain.session_key import SessionKey, is_group_type
 from .astrbot_platform import resolve_platform_instance
 
 try:  # pragma: no cover - 取决于 AstrBot 版本
@@ -50,10 +50,8 @@ PROACTIVE_MESSAGE_ID_PREFIX = "proactive"
 
 
 def resolve_message_type(umo: str) -> MessageType:
-    """根据 UMO 推断标准 MessageType（群聊或私聊）。"""
-    return (
-        MessageType.GROUP_MESSAGE if is_group_umo(umo) else MessageType.FRIEND_MESSAGE
-    )
+    """主动消息始终是私聊消息。"""
+    return MessageType.FRIEND_MESSAGE
 
 
 def resolve_self_id(plugin: Any, umo: str) -> str:
@@ -165,7 +163,6 @@ class ProactiveMessageEvent(_EventBase):  # type: ignore[misc, valid-type]
         self_id: str,
         sender_id: str = "",
         sender_name: str = "",
-        is_group: bool = False,
         persist_history: Any = None,
     ) -> None:
         # 注意：基类 __init__ 内部会读取 self.unified_msg_origin，
@@ -173,7 +170,6 @@ class ProactiveMessageEvent(_EventBase):  # type: ignore[misc, valid-type]
         self._proactive_plugin = plugin
         self._proactive_target_id = target_id
         self._proactive_umo = session_id
-        self._proactive_is_group = is_group
         self._proactive_persist_history = persist_history
         self.proactive_sent_chains: list[MessageChain] = []
         self.proactive_send_failed = False
@@ -186,12 +182,10 @@ class ProactiveMessageEvent(_EventBase):  # type: ignore[misc, valid-type]
         message_obj.message = []
         message_obj.message_str = ""
         message_obj.raw_message = None
-        resolved_sender = sender_id or ("" if is_group else target_id)
+        resolved_sender = sender_id or target_id
         message_obj.sender = MessageMember(
             user_id=str(resolved_sender), nickname=sender_name or None
         )
-        if is_group:
-            message_obj.group = Group(group_id=target_id)
 
         super().__init__(
             message_str="",
@@ -244,11 +238,7 @@ class ProactiveMessageEvent(_EventBase):  # type: ignore[misc, valid-type]
                 try:
                     session_obj = MessageSession(
                         platform_name=platform.meta().id,
-                        message_type=(
-                            MessageType.GROUP_MESSAGE
-                            if self._proactive_is_group
-                            else MessageType.FRIEND_MESSAGE
-                        ),
+                        message_type=MessageType.FRIEND_MESSAGE,
                         session_id=self._proactive_target_id,
                     )
                     await platform.send_by_session(session_obj, message)
@@ -346,18 +336,21 @@ def build_proactive_event(
     if persist_history is None:
         persist_history = _resolve_persist_history_callback(plugin)
 
-    is_group = is_group_umo(msg_type_str)
+    if is_group_type(msg_type_str):
+        logger.warning(
+            f"[主动消息] 拒绝为群聊会话构造主动消息事件喵: {session_id}"
+        )
+        return None
     try:
         return ProactiveMessageEvent(
             plugin=plugin,
             platform_meta=platform_meta,
             session_id=session_id,
             target_id=target_id,
-            message_type=resolve_message_type(msg_type_str),
+            message_type=MessageType.FRIEND_MESSAGE,
             self_id=self_id,
             sender_id=sender_id,
             sender_name=sender_name,
-            is_group=is_group,
             persist_history=persist_history,
         )
     except Exception as e:  # pragma: no cover - 防御性兜底

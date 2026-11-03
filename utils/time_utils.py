@@ -36,3 +36,51 @@ def format_current_time(tz: zoneinfo.ZoneInfo | None = None) -> str:
     now = datetime.now(tz) if tz else datetime.now()
     weekday = _WEEKDAY_NAMES_ZH[now.weekday()]
     return f"{now.strftime('%Y年%m月%d日')} {weekday} {now.strftime('%H:%M')}"
+
+
+def format_relative_gap(
+    seconds: float | int | None,
+    *,
+    empty: str = "暂无记录",
+) -> str:
+    """把时间差格式化为适合写进提示词的中文相对时间。"""
+    if seconds is None:
+        return empty
+    try:
+        value = max(0.0, float(seconds))
+    except (TypeError, ValueError):
+        return empty
+
+    if value < 60:
+        return "刚刚"
+    if value < 3600:
+        return f"{int(value // 60)} 分钟前"
+    if value < 86400:
+        return f"{int(value // 3600)} 小时前"
+    days = int(value // 86400)
+    if days < 30:
+        return f"{days} 天前"
+    months = days // 30
+    if months < 12:
+        return f"{months} 个月前"
+    return f"{days // 365} 年前"
+
+
+def describe_day_part(hour: int) -> str:
+    """把小时映射为一天中的时段描述。"""
+    hour = int(hour) % 24
+    if hour < 5:
+        return "深夜"
+    if hour < 8:
+        return "清晨"
+    if hour < 11:
+        return "上午"
+    if hour < 13:
+        return "中午"
+    if hour < 17:
+        return "下午"
+    if hour < 19:
+        return "傍晚"
+    if hour < 23:
+        return "晚上"
+    return "深夜"

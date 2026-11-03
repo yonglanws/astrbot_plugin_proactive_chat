@@ -1,8 +1,8 @@
 name: "astrbot_plugin_proactive_chat"
-display_name: "主动消息 (Proactive Chat)"
-author: "DBJD-CR"
-version: "v1.3.0-beta.1"
-desc: "一个能让 Bot 在私聊和群聊中发起主动消息的插件，拥有上下文感知、持久化数据、动态情绪、免打扰时段和 TTS 集成。还有独立 WebUI，可进行个性化配置。"
+display_name: "私聊主动消息"
+author: "DBJD-CR & 慵懒午睡"
+version: "v2.4.0"
+desc: "只面向私聊的主动消息插件：根据互动强度动态调整概率与间隔，并通过作息节律、关系状态、主动意图、回复质量、自然度守卫、气泡发送计划、心情/精力与开放话题让主动消息更自然。可选接入 LivingMemory 长期记忆、planner/critic 多阶段生成与离线回放。支持 QQ 官方机器人、上下文感知、免打扰、连续未回复暂停、TTS，以及 AstrBot 原生插件页面与独立 WebUI。"
 repo: "https://github.com/Pancakes-Labs/astrbot_plugin_proactive_chat"
 astrbot_version: ">=4.24.0"
 support_platforms:
@@ -16,9 +16,12 @@ support_platforms:
   - lark
   - dingtalk
   - kook
-social_link: https://github.com/DBJD-CR
 tags:
+  - 私聊
   - 主动消息
+  - 互动强度
   - 拟人
+  - 作息节律
+  - 长期记忆
   - TTS
   - WebUI

@@ -30,7 +30,7 @@ jobs:
           BUILD_ROOT="${RUNNER_TEMP}/plugin-build"
           STAGE_DIR="${BUILD_ROOT}/${PACKAGE_NAME}"
           ZIP_NAME="${PACKAGE_NAME}-${GITHUB_REF_NAME}.zip"
-          BUILD_JS_DIR="admin/.js-build"
+          BUILD_JS_DIR="views/proactive-chat/.js-build"
           BABEL_TOOLS_DIR="${RUNNER_TEMP}/babel-tools"
 
           rm -rf "${BUILD_ROOT}"
@@ -58,13 +58,13 @@ jobs:
 
           pushd "${STAGE_DIR}"
 
-          if [[ ! -d "admin/js" ]]; then
-            echo "::error::未找到 admin/js，无法编译 WebUI"
+          if [[ ! -d "views/proactive-chat/js" ]]; then
+            echo "::error::未找到 views/proactive-chat/js，无法编译 WebUI"
             exit 1
           fi
 
-          if [[ ! -f "admin/index.html" ]]; then
-            echo "::error::未找到 admin/index.html，无法修正 WebUI 入口"
+          if [[ ! -f "views/proactive-chat/index.html" ]]; then
+            echo "::error::未找到 views/proactive-chat/index.html，无法修正 WebUI 入口"
             exit 1
           fi
 
@@ -86,68 +86,68 @@ jobs:
           popd
 
           NODE_ENV=production BABEL_ENV=production NODE_PATH="${BABEL_TOOLS_DIR}/node_modules" \
-          "${BABEL_TOOLS_DIR}/node_modules/.bin/babel" admin/js \
+          "${BABEL_TOOLS_DIR}/node_modules/.bin/babel" views/proactive-chat/js \
             --extensions ".js,.jsx" \
             --out-dir "${BUILD_JS_DIR}" \
             --config-file "${BABEL_TOOLS_DIR}/babel.config.json" \
             --no-babelrc
 
-          rm -rf admin/js
-          mv "${BUILD_JS_DIR}" admin/js
+          rm -rf views/proactive-chat/js
+          mv "${BUILD_JS_DIR}" views/proactive-chat/js
 
           # 发布包中的前端已由 Babel 预编译为 .js，必须让 index.html 的引用与产物保持一致。
           # 组件通过 ProactiveLoader.queueScript(src, isBabel) 动态加载，
           # 这些是普通字符串参数而非 HTML 标签，旧的 sed 规则无法匹配，会导致 404 / “Babel is not loaded”。
           # 1) 所有指向本地 js/ 的 .jsx 引用统一改写为预编译后的 .js。
-          sed -E -i 's|"(js/[^"]*)\.jsx"|"\1.js"|g' admin/index.html
+          sed -E -i 's|"(js/[^"]*)\.jsx"|"\1.js"|g' views/proactive-chat/index.html
           # 2) 遗留的 text/babel 静态标签改写为普通脚本标签（源码已预编译，无需运行时编译）。
-          sed -E -i 's|<script type="text/babel" src="([^"]+)" defer></script>|<script src="\1" defer></script>|g' admin/index.html
-          sed -E -i 's|<script type="text/babel" src="([^"]+)"></script>|<script src="\1"></script>|g' admin/index.html
+          sed -E -i 's|<script type="text/babel" src="([^"]+)" defer></script>|<script src="\1" defer></script>|g' views/proactive-chat/index.html
+          sed -E -i 's|<script type="text/babel" src="([^"]+)"></script>|<script src="\1"></script>|g' views/proactive-chat/index.html
           # 3) 关闭 queueScript 的 isBabel 标志：产物已是编译后的 JS。
-          sed -E -i 's|(queueScript\("[^"]*")([[:space:]]*,[[:space:]]*)true([[:space:]]*\))|\1\2false\3|g' admin/index.html
+          sed -E -i 's|(queueScript\("[^"]*")([[:space:]]*,[[:space:]]*)true([[:space:]]*\))|\1\2false\3|g' views/proactive-chat/index.html
           # 4) 移除 Babel standalone 依赖及其脚本文件。
-          sed -E -i '/@babel\/standalone|lib\/babel\.min\.js/d' admin/index.html
-          rm -f admin/lib/babel.min.js
+          sed -E -i '/@babel\/standalone|lib\/babel\.min\.js/d' views/proactive-chat/index.html
+          rm -f views/proactive-chat/lib/babel.min.js
 
-          if grep -q 'text/babel' admin/index.html; then
+          if grep -q 'text/babel' views/proactive-chat/index.html; then
             echo "::error::WebUI 编译后 index.html 仍包含 text/babel 引用"
             exit 1
           fi
 
-          if grep -q '@babel/standalone' admin/index.html; then
+          if grep -q '@babel/standalone' views/proactive-chat/index.html; then
             echo "::error::WebUI 编译后 index.html 仍包含 Babel Standalone 依赖"
             exit 1
           fi
 
-          if grep -Eq 'queueScript\("[^"]*\.jsx"' admin/index.html; then
+          if grep -Eq 'queueScript\("[^"]*\.jsx"' views/proactive-chat/index.html; then
             echo "::error::WebUI 编译后 index.html 仍存在指向 .jsx 的 queueScript 调用，运行时会 404"
             exit 1
           fi
 
-          if grep -Eq 'queueScript\("[^"]*",[[:space:]]*true[[:space:]]*\)' admin/index.html; then
+          if grep -Eq 'queueScript\("[^"]*",[[:space:]]*true[[:space:]]*\)' views/proactive-chat/index.html; then
             echo "::error::WebUI 编译后 index.html 仍存在 isBabel=true 的 queueScript 调用（缺少 Babel standalone 时会中断加载）"
             exit 1
           fi
 
-          if grep -q '\.jsx"' admin/index.html; then
+          if grep -q '\.jsx"' views/proactive-chat/index.html; then
             echo "::error::WebUI 编译后 index.html 仍存在 .jsx 资源引用"
             exit 1
           fi
 
-          if find admin/js -type f -name '*.jsx' | grep -q .; then
+          if find views/proactive-chat/js -type f -name '*.jsx' | grep -q .; then
             echo "::error::WebUI 编译后仍存在 .jsx 源文件"
             exit 1
           fi
 
           # 产物必须是可直接被普通 script 执行的脚本（UMD/IIFE 风格），
           # 出现顶层 import/export 即说明 Babel 又切回了 automatic runtime 或产出了 ESM。
-          if grep -rEq '^[[:space:]]*(import|export)[[:space:]{*]' admin/js; then
+          if grep -rEq '^[[:space:]]*(import|export)[[:space:]{*]' views/proactive-chat/js; then
             echo "::error::WebUI 编译产物包含 ESM import/export，普通 script 加载会白屏"
-            grep -rEn '^[[:space:]]*(import|export)[[:space:]{*]' admin/js | head -n 10
+            grep -rEn '^[[:space:]]*(import|export)[[:space:]{*]' views/proactive-chat/js | head -n 10
             exit 1
           fi
 
-          if grep -rq 'react/jsx-runtime' admin/js; then
+          if grep -rq 'react/jsx-runtime' views/proactive-chat/js; then
             echo "::error::WebUI 编译产物引用了 react/jsx-runtime，说明 preset-react 使用了 automatic runtime"
             exit 1
           fi
