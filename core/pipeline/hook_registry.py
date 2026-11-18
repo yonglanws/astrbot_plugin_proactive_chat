@@ -16,11 +16,11 @@ class HookRegistry:
 
     _stages: dict[HookPoint, list] = field(default_factory=dict)
 
-    # 稳定的执行顺序，与骨架设计一致。
+    # 稳定的执行顺序：CONTEXT 在 INTENT 之前，确保意图选择能感知最新对话收尾线索。
     ORDER: tuple[HookPoint, ...] = (
         HookPoint.GATE,
-        HookPoint.INTENT,
         HookPoint.CONTEXT,
+        HookPoint.INTENT,
         HookPoint.PLAN,
         HookPoint.PROMPT,
         HookPoint.DELIBERATE,

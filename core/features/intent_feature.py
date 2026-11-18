@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import random
 
 from astrbot.api import logger
@@ -41,21 +42,47 @@ class IntentStage(BaseStage):
         except Exception:
             open_loops = 0
 
-        async with plugin.data_lock:
-            decision = plugin.conversation_state_service.choose_intent(
-                session_id,
-                session_config=session_config,
-                persona_energy=energy,
-                open_loop_count=open_loops,
-                now=ctx.started_at,
-                rng=random,
-                manual=manual,
-            )
+        recent_history = (ctx.extra or {}).get("history") or (ctx.extra or {}).get(
+            "raw_history"
+        )
+        choose_fn = plugin.conversation_state_service.choose_intent
+        choose_kwargs = {
+            "session_config": session_config,
+            "persona_energy": energy,
+            "open_loop_count": open_loops,
+            "now": ctx.started_at,
+            "rng": random,
+            "manual": manual,
+        }
+        try:
+            sig = inspect.signature(choose_fn)
+            if "recent_history" in sig.parameters or any(
+                p.kind is inspect.Parameter.VAR_KEYWORD
+                for p in sig.parameters.values()
+            ):
+                choose_kwargs["recent_history"] = recent_history
+        except (TypeError, ValueError):
+            pass
+
+        lock = getattr(plugin, "data_lock", None)
+        if lock is not None:
+            async with lock:
+                decision = choose_fn(session_id, **choose_kwargs)
+        else:
+            decision = choose_fn(session_id, **choose_kwargs)
 
         ctx.extra["intent_decision"] = decision
         ctx.extra["intent"] = decision.get("intent", "continue_topic")
         ctx.extra["intent_brief"] = decision.get("brief", "")
         ctx.extra["conversation_state"] = decision.get("state", "idle")
+        humanization = ctx.extra.get("humanization")
+        if isinstance(humanization, dict):
+            humanization["intent"] = ctx.extra["intent"]
+            humanization["intent_brief"] = ctx.extra["intent_brief"]
+            humanization["intent_label"] = decision.get("intent_label", "")
+            humanization["conversation_state"] = (
+                humanization.get("conversation_state") or {}
+            )
 
         if decision.get("silent"):
             # 有时候什么都不说，比硬找一句话更自然。沉默不是失败，
@@ -82,7 +109,7 @@ class IntentStage(BaseStage):
             min_minutes = max(1, int(schedule_conf.get("min_interval_minutes", 30)))
         except (TypeError, ValueError):
             min_minutes = 30
-        return max(600, int(min_minutes * 60 * 0.25))
+        return max(600, int(min_minutes * 60 * 0.65))
 
 
 class IntentFeature:

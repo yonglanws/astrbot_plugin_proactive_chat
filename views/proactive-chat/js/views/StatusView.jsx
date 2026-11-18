@@ -138,7 +138,7 @@ function StatusView({ onRefresh }) {
     const memoryStatus = status.memory_status || {};
     const nowMs = useNow();
     const [refreshState, setRefreshState] = React.useState({ phase: 'idle' });
-    const displayTimezone = state.config?.displayTimezone || 'Asia/Shanghai';
+    const displayTimezone = window.resolveDisplayTimezone(state.config);
     const snapshotAtMs = Number(state.statusReceivedAt || 0);
 
     const uptimeSeconds = Number(status.uptime_seconds || 0);
@@ -200,6 +200,14 @@ function StatusView({ onRefresh }) {
 
     return (
         <Box>
+            {status.plugin_set_warning ? (
+                <div
+                    className="card app-error-card"
+                    style={{ marginBottom: 16, whiteSpace: 'pre-wrap', fontWeight: 600 }}
+                >
+                    ⚠️ {status.plugin_set_warning}
+                </div>
+            ) : null}
             <div className="dashboard-grid proactive-status-grid">
                 <div className="span-4">
                     <div className="card status-panel-card status-panel-card-primary">

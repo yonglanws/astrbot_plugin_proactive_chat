@@ -15,6 +15,7 @@ bridge 调用插件注册的 Web API。这里把独立 Web 管理端已有的能
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import subprocess
@@ -84,6 +85,8 @@ class PageApiRoutes:
         self.state = StateBuilder(plugin, get_plugin_version(default="未知版本"))
         self.registered = False
         self._register_error: str | None = None
+        self._route_prefix = f"/{PLUGIN_NAME}/"
+        self._fallback_tasks: set[asyncio.Task[Any]] = set()
 
     # ------------------------------------------------------------------
     # 注册
@@ -112,6 +115,7 @@ class PageApiRoutes:
             ("config", self.get_config, ["GET"]),
             ("config", self.update_config, ["POST"]),
             ("config-schema", self.get_config_schema, ["GET"]),
+            ("providers", self.list_providers, ["GET"]),
             ("sessions", self.list_sessions, ["GET"]),
             ("session-config", self.get_session_config, ["GET"]),
             ("session-config", self.update_session_config, ["POST"]),
@@ -153,6 +157,27 @@ class PageApiRoutes:
         logger.info("[主动消息] 已注册 AstrBot 插件页面 API 喵。")
         return True
 
+    def unregister(self) -> None:
+        """插件卸载/停用时移除页面 API 路由。
+
+        AstrBot 的 ``Context.registered_web_apis`` 是类属性，框架卸载插件时
+        不会自动清理；如果不移除，路由会继续指向旧实例，页面可能读到过期
+        数据，旧插件实例也无法释放。
+        """
+        context = getattr(self.plugin, "context", None)
+        registered = getattr(context, "registered_web_apis", None)
+        if isinstance(registered, list):
+            registered[:] = [
+                api
+                for api in registered
+                if not (
+                    isinstance(api, (tuple, list))
+                    and str(api[0]).startswith(self._route_prefix)
+                )
+            ]
+        self.registered = False
+        logger.info("[主动消息] 已移除 AstrBot 插件页面 API 路由喵。")
+
     def status_snapshot(self) -> dict[str, Any]:
         """供管理端展示页面 API 是否可用。"""
         return {
@@ -190,6 +215,146 @@ class PageApiRoutes:
         value = self.plugin.config.get(key)
         return dict(value) if isinstance(value, dict) else {}
 
+    @staticmethod
+    def _coerce_int(value: Any, default: int = 0) -> int:
+        if value is None or isinstance(value, bool):
+            return default
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _is_paused_or_at_limit(
+        self, normalized: str, session_config: dict[str, Any] | None
+    ) -> bool:
+        plugin = self.plugin
+        scheduler_service = getattr(plugin, "scheduler_service", None)
+        if scheduler_service is not None and scheduler_service.is_session_paused(
+            normalized
+        ):
+            return True
+        schedule_conf = (session_config or {}).get("schedule_settings") or {}
+        max_unanswered = self._coerce_int(
+            schedule_conf.get("max_unanswered_times", 4), 4
+        )
+        session_info = (getattr(plugin, "session_data", None) or {}).get(normalized)
+        unanswered_count = self._coerce_int(
+            session_info.get("unanswered_count", 0)
+            if isinstance(session_info, dict)
+            else 0,
+            0,
+        )
+        return max_unanswered > 0 and unanswered_count >= max_unanswered
+
+    def _invalidate_orchestrator_runner(self) -> None:
+        for attr in ("orchestrator", "flow_orchestrator"):
+            orchestrator = getattr(self.plugin, attr, None)
+            if orchestrator is None:
+                continue
+            invalidate = getattr(orchestrator, "invalidate_runner", None)
+            if callable(invalidate):
+                invalidate()
+            elif hasattr(orchestrator, "_runner"):
+                orchestrator._runner = None
+
+    async def _refresh_after_config_change(
+        self, target_session: str | None = None
+    ) -> None:
+        self._invalidate_orchestrator_runner()
+        plugin = self.plugin
+        scheduler_service = getattr(plugin, "scheduler_service", None)
+        config_service = getattr(plugin, "config_service", None)
+        if scheduler_service is None or config_service is None:
+            return
+
+        if target_session is not None:
+            effective = config_service.get_session_config(target_session)
+            if not effective or not effective.get("enable", False):
+                cancel_fn = getattr(scheduler_service, "cancel_session_schedule", None)
+                if inspect.iscoroutinefunction(cancel_fn):
+                    await cancel_fn(target_session)
+                else:
+                    cancel_auto = getattr(
+                        scheduler_service, "cancel_all_related_auto_triggers", None
+                    )
+                    if inspect.iscoroutinefunction(cancel_auto):
+                        await cancel_auto(target_session)
+                return
+
+            auto_enabled = bool(
+                (effective.get("auto_trigger_settings") or {}).get(
+                    "enable_auto_trigger", False
+                )
+            )
+            if not auto_enabled:
+                cancel_auto = getattr(
+                    scheduler_service, "cancel_all_related_auto_triggers", None
+                )
+                if inspect.iscoroutinefunction(cancel_auto):
+                    await cancel_auto(target_session)
+                return
+
+            setup_one = getattr(
+                scheduler_service, "setup_auto_trigger_for_session_config", None
+            )
+            if inspect.iscoroutinefunction(setup_one):
+                await setup_one(effective, target_session)
+            return
+
+        scheduler = getattr(plugin, "scheduler", None)
+        if scheduler is not None and callable(getattr(scheduler, "get_jobs", None)):
+            jobs = scheduler.get_jobs() or []
+            if isinstance(jobs, (list, tuple)):
+                for job in list(jobs):
+                    job_id = str(getattr(job, "id", "") or "")
+                    if not job_id:
+                        continue
+                    effective = config_service.get_session_config(job_id)
+                    if not effective or not effective.get("enable", False):
+                        cancel_fn = getattr(
+                            scheduler_service, "cancel_session_schedule", None
+                        )
+                        if inspect.iscoroutinefunction(cancel_fn):
+                            await cancel_fn(job_id)
+
+        timers = getattr(plugin, "auto_trigger_timers", None)
+        if isinstance(timers, dict):
+            for sid in list(timers.keys()):
+                effective = config_service.get_session_config(sid)
+                auto_enabled = bool(
+                    effective
+                    and effective.get("enable", False)
+                    and (effective.get("auto_trigger_settings") or {}).get(
+                        "enable_auto_trigger", False
+                    )
+                )
+                if not auto_enabled:
+                    cancel_auto = getattr(
+                        scheduler_service, "cancel_all_related_auto_triggers", None
+                    )
+                    if inspect.iscoroutinefunction(cancel_auto):
+                        await cancel_auto(sid)
+
+        setup_all = getattr(
+            scheduler_service, "setup_auto_triggers_for_enabled_sessions", None
+        )
+        if inspect.iscoroutinefunction(setup_all):
+            await setup_all()
+
+    def _track_manual_task(
+        self, normalized: str, task: asyncio.Task[Any]
+    ) -> None:
+        track_task = getattr(self.plugin, "_track_task", None)
+        if callable(track_task):
+            track_task(task)
+        else:
+            self._fallback_tasks.add(task)
+            task.add_done_callback(self._fallback_tasks.discard)
+
+        manual_sessions = getattr(self.plugin, "manual_trigger_sessions", None)
+        if isinstance(manual_sessions, set):
+            task.add_done_callback(lambda _t: manual_sessions.discard(normalized))
+
     # ------------------------------------------------------------------
     # 状态 / 配置
     # ------------------------------------------------------------------
@@ -217,7 +382,22 @@ class PageApiRoutes:
                     "notification_settings"
                 ),
                 "telemetry_config": self._config_group("telemetry_config"),
+                # 前端按 AstrBot 实际调度时区展示时间，不能写死 Asia/Shanghai。
+                "displayTimezone": self._display_timezone(),
             }
+        )
+
+    def _display_timezone(self) -> str:
+        """返回前端可用的 IANA 时区名；未配置时返回 local。"""
+        timezone = getattr(self.plugin, "timezone", None)
+        if timezone is None:
+            return "local"
+        return str(getattr(timezone, "key", None) or timezone or "local")
+
+    async def list_providers(self):
+        """列出 AstrBot 已加载的聊天 Provider，供配置页下拉选择。"""
+        return json_response(
+            {"providers": self.plugin.config_service.list_chat_providers()}
         )
 
     async def get_config_schema(self):
@@ -282,9 +462,11 @@ class PageApiRoutes:
             self.plugin.config.save_config()
         except Exception as e:
             logger.error(f"[主动消息] 页面保存配置失败喵: {e}")
+            await self._refresh_after_config_change()
             await self._broadcast("config")
             return self._error(f"配置已应用到内存，但保存到磁盘失败: {e}", 500)
 
+        await self._refresh_after_config_change()
         await self._broadcast("config")
         return json_response({"ok": True})
 
@@ -296,6 +478,9 @@ class PageApiRoutes:
         for session in self.state.list_known_sessions():
             override = self.plugin.session_override_manager.get_override(session)
             effective = self.plugin.config_service.get_session_config(session)
+            session_info = dict(
+                (getattr(self.plugin, "session_data", None) or {}).get(session) or {}
+            )
             result.append(
                 {
                     "session": session,
@@ -310,12 +495,8 @@ class PageApiRoutes:
                     "has_override": bool(override),
                     "override_keys": list(override.keys()),
                     "enabled": bool(effective and effective.get("enable", False)),
-                    "next_trigger_time": self.plugin.session_data.get(session, {}).get(
-                        "next_trigger_time"
-                    ),
-                    "unanswered_count": self.plugin.session_data.get(session, {}).get(
-                        "unanswered_count", 0
-                    ),
+                    "next_trigger_time": session_info.get("next_trigger_time"),
+                    "unanswered_count": session_info.get("unanswered_count", 0),
                 }
             )
         return json_response({"sessions": result})
@@ -366,6 +547,7 @@ class PageApiRoutes:
                 normalized, base, effective
             )
 
+        await self._refresh_after_config_change(normalized)
         await self._broadcast("session-config")
         return json_response(
             {
@@ -390,6 +572,7 @@ class PageApiRoutes:
             return self._error("缺少会话标识 umo")
         normalized = self._normalize(umo)
         await self.plugin.session_override_manager.delete_override(normalized)
+        await self._refresh_after_config_change(normalized)
         await self._broadcast("session-config")
         return json_response(
             {
@@ -423,9 +606,10 @@ class PageApiRoutes:
         session_config = self.plugin.config_service.get_session_config(normalized)
         if not session_config or not session_config.get("enable", False):
             return self._error("会话未启用或配置不存在，无法重新调度", 400)
-        if self.plugin.scheduler_service.is_session_paused(normalized):
+        if self._is_paused_or_at_limit(normalized, session_config):
             return self._error(
-                "会话处于未回复暂停中，请先恢复或等待用户发来新消息", 409
+                "会话处于未回复暂停中或已达连续未回复上限，请先恢复后再重新调度",
+                400,
             )
 
         await self.plugin.scheduler_service.schedule_next_chat_and_save(
@@ -446,20 +630,25 @@ class PageApiRoutes:
         if not umo:
             return self._error("缺少会话标识 umo")
         normalized = self._normalize(umo)
-        if self.plugin.scheduler_service.is_session_paused(normalized):
+        session_config = self.plugin.config_service.get_session_config(normalized)
+        if not session_config or not session_config.get("enable", False):
+            return self._error("会话未启用或配置不存在，无法立即触发", 400)
+        if self._is_paused_or_at_limit(normalized, session_config):
             return self._error(
-                "会话处于未回复暂停中，请先恢复或等待用户发来新消息", 409
+                "会话处于未回复暂停中或已达连续未回复上限，请先恢复或等待用户发来新消息",
+                409,
             )
-        if normalized in self.plugin.manual_trigger_sessions:
-            return self._error("该任务正在立即触发中，请等待当前执行完成", 409)
+        if (
+            normalized in self.plugin.manual_trigger_sessions
+            or normalized in getattr(self.plugin, "active_trigger_sessions", set())
+        ):
+            return self._error("该会话已有主动消息正在执行，请等待当前执行完成", 409)
 
         self.plugin.manual_trigger_sessions.add(normalized)
-        track_task = getattr(self.plugin, "_track_task", None)
         task = asyncio.create_task(
             self.plugin.check_and_chat(normalized, TriggerSource.MANUAL)
         )
-        if callable(track_task):
-            track_task(task)
+        self._track_manual_task(normalized, task)
         await self._broadcast("jobs")
         return json_response(
             {
@@ -502,16 +691,34 @@ class PageApiRoutes:
         if not umo:
             return self._error("缺少会话标识 umo")
         normalized = self._normalize(umo)
-        removed = False
-        try:
-            self.plugin.scheduler.remove_job(normalized)
-            removed = True
-        except Exception:
-            pass
+        cancel_fn = getattr(
+            self.plugin.scheduler_service, "cancel_session_schedule", None
+        )
+        if inspect.iscoroutinefunction(cancel_fn):
+            removed = bool(await cancel_fn(normalized))
+        else:
+            removed = False
+            try:
+                self.plugin.scheduler.remove_job(normalized)
+                removed = True
+            except Exception:
+                pass
 
-        async with self.plugin.data_lock:
-            if normalized in self.plugin.session_data:
-                self.plugin.session_data[normalized].pop("next_trigger_time", None)
+            cancel_auto = getattr(
+                self.plugin.scheduler_service, "cancel_all_related_auto_triggers", None
+            )
+            if inspect.iscoroutinefunction(cancel_auto):
+                try:
+                    if await cancel_auto(normalized):
+                        removed = True
+                except Exception:
+                    pass
+
+            async with self.plugin.data_lock:
+                session_info = self.plugin.session_data.setdefault(normalized, {})
+                if session_info.pop("next_trigger_time", None) is not None:
+                    removed = True
+                session_info["schedule_cancelled"] = True
                 await self.plugin.storage_service.save_data()
 
         await self._broadcast("jobs")

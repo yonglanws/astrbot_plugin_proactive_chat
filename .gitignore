@@ -16,6 +16,11 @@ eggs/
 .eggs/
 lib/
 lib64/
+# 前端 UMD 依赖需要随插件一起分发，不能被 Python 模板的 lib/ 规则忽略。
+!views/proactive-chat/lib/
+!views/proactive-chat/lib/**
+# JSX 检查工具的本地依赖不进入版本库。
+tools/node_modules/
 parts/
 sdist/
 var/

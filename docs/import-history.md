@@ -31,6 +31,7 @@ python tools/import_astrbot_history.py \
 | --- | --- | --- |
 | `--db` | 必填 | `data_v4.db` 路径 |
 | `--platform` | 全部 | 只导入某个平台前缀，如 `qq_official` |
+| `--umo` | 全部 | 只导入指定 UMO，可重复传入；优先级高于 `--platform` |
 | `--timezone` | `Asia/Shanghai` | 数据库时间里所在的时区 |
 | `--report` | `intensity_report.json` | 报告路径；传空字符串则不写 |
 | `--data-dir` | - | 插件数据目录 |
@@ -60,6 +61,19 @@ python tools/import_astrbot_history.py \
 5. 原子替换文件。
 
 建议 `--min-messages 20` 或更高，只给真正聊过的用户做种子，避免一次写入几百个一次性会话。
+
+如果只想给某个已开启的会话补种子：
+
+```bash
+python tools/import_astrbot_history.py \
+  --db /path/to/AstrBot/data/data_v4.db \
+  --umo "qq_offficial:FriendMessage:<openid>" \
+  --min-messages 1 \
+  --data-dir /path/to/AstrBot/data/plugin_data/astrbot_plugin_proactive_chat \
+  --write
+```
+
+Windows 网络盘/UNC 路径（如 `Z:/...`）现在会使用 SQLite 的四斜杠 URI，不会再把服务器名误判为 URI authority。
 
 ---
 

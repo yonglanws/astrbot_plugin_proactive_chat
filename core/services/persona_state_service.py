@@ -111,13 +111,20 @@ class PersonaStateService:
         *,
         session_config: Mapping[str, Any] | None = None,
         now: float | None = None,
+        read_only: bool = False,
     ) -> dict[str, Any]:
+        """纯时间衰减与昼夜精力刷新（幂等，不重复扣除事件惩罚）。"""
         timestamp = float(now if now is not None else time.time())
         settings = self.get_settings(session_config)
-        state = self.get_state(session_id, create=True)
+        if read_only:
+            existing = self.get_state(session_id, create=False)
+            state = dict(existing)
+        else:
+            state = self.get_state(session_id, create=True)
         baseline = settings.baseline_energy
         local = self._local_datetime(timestamp)
         curve = persona_energy_curve(local.hour)
+        is_weekend = local.weekday() >= 5
 
         if not settings.enabled:
             state["energy"] = baseline
@@ -129,40 +136,30 @@ class PersonaStateService:
         previous = clamp(float(state.get("energy", baseline) or baseline))
         last_update = float(state.get("updated_at", 0) or 0)
         hours = max(0.0, (timestamp - last_update) / 3600.0) if last_update else 0.0
-        # 精力以 6 小时为半衰期回归基线，再向当前时段曲线靠拢。
-        decayed = baseline + (previous - baseline) * (0.5 ** (hours / 6.0))
-        target = baseline * 0.4 + curve * 0.6
-        energy = clamp(decayed * 0.7 + target * 0.3)
+        # 精力以 6 小时为半衰期向当前时段曲线与基线的平衡点回归，完全幂等。
+        target = clamp(baseline * 0.4 + curve * 0.6)
+        if last_update <= 0:
+            energy = target
+        else:
+            decay_weight = 0.5 ** (hours / 6.0)
+            energy = clamp(target + (previous - target) * decay_weight)
 
         payload = (
             getattr(self.plugin, "session_data", {}).get(session_id, {})
             if isinstance(getattr(self.plugin, "session_data", {}), dict)
             else {}
         )
-        unanswered = int(payload.get("unanswered_count", 0) or 0)
-        if unanswered > 0:
-            energy = clamp(energy - min(0.2, unanswered * 0.04))
-
         quality = ""
         conversation_state = payload.get("conversation_state")
         if isinstance(conversation_state, dict):
             quality = str(conversation_state.get("last_user_quality") or "")
-        if quality == ReplyQuality.NEGATIVE.value:
-            energy = clamp(energy - 0.15)
-        elif quality == ReplyQuality.PERFUNCTORY.value:
-            energy = clamp(energy - 0.03)
-        elif quality in {
-            ReplyQuality.SUBSTANTIVE.value,
-            ReplyQuality.QUESTION.value,
-        }:
-            energy = clamp(energy + 0.05)
 
         state["energy"] = round(energy, 4)
         state["updated_at"] = timestamp
         state["mood"] = self._derive_mood(
             energy, quality, settings.low_energy_threshold
         )
-        state["activity"] = self._derive_activity(local.hour)
+        state["activity"] = self._derive_activity(local.hour, is_weekend=is_weekend)
         return state
 
     @staticmethod
@@ -181,8 +178,20 @@ class PersonaStateService:
         return "calm"
 
     @staticmethod
-    def _derive_activity(hour: int) -> str:
+    def _derive_activity(hour: int, *, is_weekend: bool = False) -> str:
         hour = int(hour) % 24
+        if is_weekend:
+            if hour < 7:
+                return "还没睡或刚睡下"
+            if hour < 10:
+                return "周末刚醒，在赖床"
+            if hour < 13:
+                return "周末慢悠悠吃点东西"
+            if hour < 18:
+                return "周末在外面逛或宅着摸鱼"
+            if hour < 22:
+                return "周末晚上在放松"
+            return "准备睡了"
         if hour < 6:
             return "准备休息"
         if hour < 9:
@@ -194,7 +203,7 @@ class PersonaStateService:
         if hour < 18:
             return "在忙，但偶尔会看手机"
         if hour < 22:
-            return "在放松"
+            return "忙完了在放松"
         return "准备睡了"
 
     # ------------------------------------------------------------------
@@ -209,6 +218,8 @@ class PersonaStateService:
         session_config: Mapping[str, Any] | None = None,
     ) -> None:
         timestamp = float(now if now is not None else time.time())
+        if not self.get_settings(session_config).enabled:
+            return
         state = self.get_state(session_id, create=True)
         self.refresh(
             session_id, session_config=session_config, now=timestamp
@@ -237,12 +248,21 @@ class PersonaStateService:
         session_config: Mapping[str, Any] | None = None,
     ) -> None:
         timestamp = float(now if now is not None else time.time())
+        if not self.get_settings(session_config).enabled:
+            return
         state = self.get_state(session_id, create=True)
         self.refresh(
             session_id, session_config=session_config, now=timestamp
         )
+        payload = (
+            getattr(self.plugin, "session_data", {}).get(session_id, {})
+            if isinstance(getattr(self.plugin, "session_data", {}), dict)
+            else {}
+        )
+        unanswered = int(payload.get("unanswered_count", 0) or 0)
+        fatigue = 0.03 + min(0.08, max(0, unanswered - 1) * 0.02)
         state["energy"] = round(
-            clamp(float(state.get("energy", 0.6) or 0.6) - 0.03), 4
+            clamp(float(state.get("energy", 0.6) or 0.6) - fatigue), 4
         )
         state["last_event_at"] = timestamp
         state["updated_at"] = timestamp
@@ -256,12 +276,13 @@ class PersonaStateService:
         *,
         session_config: Mapping[str, Any] | None = None,
         now: float | None = None,
+        read_only: bool = False,
     ) -> float:
         settings = self.get_settings(session_config)
         if not settings.enabled:
             return 1.0
         state = self.refresh(
-            session_id, session_config=session_config, now=now
+            session_id, session_config=session_config, now=now, read_only=read_only
         )
         energy = float(state.get("energy", settings.baseline_energy) or 0.0)
         if energy >= settings.low_energy_threshold:
@@ -277,14 +298,25 @@ class PersonaStateService:
         *,
         session_config: Mapping[str, Any] | None = None,
         now: float | None = None,
+        read_only: bool = False,
     ) -> dict[str, Any]:
         timestamp = float(now if now is not None else time.time())
         settings = self.get_settings(session_config)
+        if not settings.enabled:
+            return {"enabled": False, "probability_multiplier": 1.0}
         state = self.refresh(
-            session_id, session_config=session_config, now=timestamp
+            session_id, session_config=session_config, now=timestamp, read_only=read_only
         )
         energy = clamp(float(state.get("energy", settings.baseline_energy) or 0.0))
         mood = str(state.get("mood") or "calm")
+        multiplier = 1.0
+        if energy < settings.low_energy_threshold:
+            deficit = (
+                settings.low_energy_threshold - energy
+            ) / max(1e-6, settings.low_energy_threshold)
+            multiplier = clamp(
+                1.0 - settings.low_energy_probability_reduction * deficit
+            )
         return {
             "enabled": settings.enabled,
             "energy": round(energy, 3),
@@ -292,12 +324,7 @@ class PersonaStateService:
             "mood": mood,
             "mood_label": MOOD_LABELS.get(mood, mood),
             "activity": str(state.get("activity") or ""),
-            "probability_multiplier": round(
-                self.probability_multiplier(
-                    session_id, session_config=session_config, now=timestamp
-                ),
-                3,
-            ),
+            "probability_multiplier": round(multiplier, 3),
             "updated_at": state.get("updated_at"),
         }
 

@@ -169,7 +169,7 @@ GUARD 阶段在发送前检查：
 2. 改写后仍不合格，或关闭改写：放弃本轮并重新调度；
 3. 结果写入 `last_guard`，管理端可追溯。
 
-纯富媒体消息（图片/语音）没有文本可校验，会直接放行。
+守卫拦截后不会派发 `OnLLMResponseEvent`。TTS 插件通常在该钩子里直接发送语音；本版本把钩子推迟到守卫通过之后，避免出现“文本被拦截、语音却已经发出去”。纯富媒体消息（图片/语音）没有文本可校验，会直接放行。
 
 ---
 
@@ -289,8 +289,8 @@ PLAN（planner，可选）
 | `critic_enabled` | `false` | 启用 critic |
 | `planner_timeout_seconds` | `8` | planner 超时 |
 | `critic_timeout_seconds` | `10` | critic 超时 |
-| `planner_provider_id` | `""` | planner 专用 Provider |
-| `critic_provider_id` | `""` | critic 专用 Provider |
+| `planner_provider_id` | `""` | planner 专用 Provider（配置页下拉选择，留空跟随当前聊天 Provider） |
+| `critic_provider_id` | `""` | critic 专用 Provider（配置页下拉选择，留空跟随当前聊天 Provider） |
 
 ---
 

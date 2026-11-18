@@ -98,6 +98,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="只导入指定平台前缀（如 qq_official / qq_offficial），默认全部",
     )
     parser.add_argument(
+        "--umo",
+        action="append",
+        default=[],
+        help="只导入指定 UMO（可重复传入），优先于 --platform",
+    )
+    parser.add_argument(
         "--timezone",
         default="Asia/Shanghai",
         help="数据库时间所在时区（默认 Asia/Shanghai）",
@@ -152,7 +158,13 @@ def connect_readonly(db_path: str) -> sqlite3.Connection:
     path = Path(db_path).expanduser().resolve()
     if not path.exists():
         raise FileNotFoundError(f"数据库不存在: {path}")
-    uri = f"file:{path.as_posix()}?mode=ro"
+    posix = path.as_posix()
+    # Windows UNC 路径（\\server\share / Z: 映射盘）必须使用四斜杠形式，
+    # 否则 sqlite 会把服务器名当成 URI authority 并报 invalid uri authority。
+    if posix.startswith("//"):
+        uri = f"file:////{posix.lstrip('/')}?mode=ro"
+    else:
+        uri = f"file:///{posix}?mode=ro"
     connection = sqlite3.connect(uri, uri=True)
     connection.row_factory = sqlite3.Row
     return connection
@@ -217,6 +229,7 @@ def load_user_messages(
     *,
     platform_filter: str,
     tz: ZoneInfo,
+    umo_filter: set[str] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     """按 UMO 聚合私聊用户消息。
 
@@ -236,7 +249,9 @@ def load_user_messages(
         if not umo:
             continue
         platform = umo.split(":", 1)[0]
-        if platform_filter and platform != platform_filter:
+        if umo_filter and umo not in umo_filter:
+            continue
+        if not umo_filter and platform_filter and platform != platform_filter:
             continue
 
         try:
@@ -513,6 +528,37 @@ def write_seed(
         json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     temp_file.replace(session_file)
+
+    # 独立种子文件：即使运行中的插件稍后把内存里的旧 session_data
+    # 写回并覆盖上面的文件，插件下次启动仍会从这份种子重新合并强度。
+    seed_file = data_dir / "intensity_seed.json"
+    existing_seed: dict[str, Any] = {}
+    try:
+        seed_document = json.loads(seed_file.read_text(encoding="utf-8"))
+        if isinstance(seed_document, dict) and isinstance(
+            seed_document.get("sessions"), dict
+        ):
+            existing_seed = seed_document["sessions"]
+    except (FileNotFoundError, json.JSONDecodeError):
+        existing_seed = {}
+    seed_sessions = dict(existing_seed)
+    seed_sessions.update(
+        {
+            item["session_id"]: states[item["session_id"]]
+            for item in results
+            if states.get(item["session_id"])
+        }
+    )
+    seed_payload = {
+        "version": 1,
+        "generated_at": datetime.now(dt_timezone.utc).isoformat(),
+        "sessions": seed_sessions,
+    }
+    seed_temp = seed_file.with_suffix(".json.tmp")
+    seed_temp.write_text(
+        json.dumps(seed_payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    seed_temp.replace(seed_file)
     return session_file
 
 
@@ -557,6 +603,7 @@ def main(argv: list[str] | None = None) -> int:
             connection,
             platform_filter=args.platform,
             tz=tz,
+            umo_filter={item.strip() for item in args.umo if item.strip()},
         )
     finally:
         connection.close()
@@ -622,7 +669,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.write:
         session_file = write_seed(results, states, Path(args.data_dir).expanduser())
-        print(f"\n强度种子已写入: {session_file.resolve()}（原文件已备份为 .json.bak）")
+        seed_file = session_file.parent / "intensity_seed.json"
+        print(
+            f"\n强度种子已写入: {session_file.resolve()} 与 {seed_file.resolve()}"
+            "（session_data.json 原文件已备份为 .json.bak）"
+        )
 
     return 0
 

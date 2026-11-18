@@ -70,6 +70,44 @@ def _install_astrbot_stubs() -> None:
         api.web = web  # type: ignore[attr-defined]
         sys.modules["astrbot.api.web"] = web
 
+        # 遥测模块在导入期需要 StarTools.get_data_dir；测试不触碰真实数据目录。
+        star_api = types.ModuleType("astrbot.api.star")
+        star_api.__path__ = []  # type: ignore[attr-defined]
+
+        class StarTools:
+            @staticmethod
+            def get_data_dir(*args, **kwargs):
+                from pathlib import Path
+                import tempfile
+
+                return Path(tempfile.gettempdir()) / "astrbot_plugin_proactive_chat_test_data"
+
+        class Star:
+            def __init__(self, context=None):
+                self.context = context
+
+        class Context:
+            registered_web_apis = []
+
+        star_api.StarTools = StarTools
+        star_api.Star = Star
+        star_api.Context = Context
+        api.star = star_api  # type: ignore[attr-defined]
+        sys.modules["astrbot.api.star"] = star_api
+
+        # main.py 的类型注解需要 AstrBotConfig；用可读写字典模拟。
+        config_module = types.ModuleType("astrbot.core.config.astrbot_config")
+        config_module.__path__ = []  # type: ignore[attr-defined]
+
+        class AstrBotConfig(dict):
+            def save_config(self):
+                return None
+
+        config_module.AstrBotConfig = AstrBotConfig
+        sys.modules["astrbot.core.config"] = types.ModuleType("astrbot.core.config")
+        sys.modules["astrbot.core.config"].__path__ = []  # type: ignore[attr-defined]
+        sys.modules["astrbot.core.config.astrbot_config"] = config_module
+
         # astrbot_provider 在导入期需要 ProviderRequest；测试只做导入与准入，
         # 不会真正构造 Provider 请求。
         provider = types.ModuleType("astrbot.api.provider")
@@ -89,7 +127,34 @@ def _install_astrbot_stubs() -> None:
         class AstrMessageEvent:
             pass
 
+        class EventMessageType:
+            PRIVATE_MESSAGE = "private_message"
+
+        class _Filter:
+            @staticmethod
+            def on_astrbot_loaded(*args, **kwargs):
+                def decorator(func):
+                    return func
+
+                return decorator
+
+            @staticmethod
+            def event_message_type(*args, **kwargs):
+                def decorator(func):
+                    return func
+
+                return decorator
+
+            @staticmethod
+            def command(*args, **kwargs):
+                def decorator(func):
+                    return func
+
+                return decorator
+
+        _Filter.EventMessageType = EventMessageType
         event_module.AstrMessageEvent = AstrMessageEvent
+        event_module.filter = _Filter()
         api.event = event_module  # type: ignore[attr-defined]
         sys.modules["astrbot.api.event"] = event_module
 
@@ -121,7 +186,36 @@ def _install_core_stubs() -> None:
                 super().__init__(chain or [])
 
         module.MessageChain = MessageChain
+
+        class ResultContentType:
+            LLM_RESULT = "llm_result"
+
+        class MessageEventResult:
+            def __init__(self):
+                self.chain = []
+                self.result_content_type = None
+
+            def set_result_content_type(self, value):
+                self.result_content_type = value
+
+        module.ResultContentType = ResultContentType
+        module.MessageEventResult = MessageEventResult
         sys.modules["astrbot.core.message.message_event_result"] = module
+
+    if "astrbot.core.message.components" not in sys.modules:
+        module = types.ModuleType("astrbot.core.message.components")
+
+        class Plain:
+            def __init__(self, text=""):
+                self.text = text
+
+        class Record:
+            def __init__(self, file=""):
+                self.file = file
+
+        module.Plain = Plain
+        module.Record = Record
+        sys.modules["astrbot.core.message.components"] = module
 
     if "astrbot.core.platform.astrbot_message" not in sys.modules:
         module = types.ModuleType("astrbot.core.platform.astrbot_message")
@@ -202,16 +296,44 @@ def _install_core_stubs() -> None:
                 self._no_save = True
                 return self
 
+        class _MessageSegment:
+            role = "user"
+
+            def __init__(self, content=None):
+                self.content = content or []
+
+            def model_dump(self):
+                return {
+                    "role": self.role,
+                    "content": [
+                        getattr(part, "text", str(part)) for part in self.content
+                    ],
+                }
+
+        class UserMessageSegment(_MessageSegment):
+            role = "user"
+
+        class AssistantMessageSegment(_MessageSegment):
+            role = "assistant"
+
         module.TextPart = TextPart
+        module.UserMessageSegment = UserMessageSegment
+        module.AssistantMessageSegment = AssistantMessageSegment
         sys.modules["astrbot.core.agent.message"] = module
 
     core.__path__ = []  # type: ignore[attr-defined]
 
 
 def _install_optional_stubs() -> None:
-    """为只测试纯合并逻辑的模块提供 aiofiles 桩。"""
+    """为只测试纯合并逻辑的模块提供 aiofiles 桩（仅在未安装真实 aiofiles 时启用）。"""
     if "aiofiles" in sys.modules:
         return
+    try:
+        import aiofiles  # noqa: F401
+        import aiofiles.os  # noqa: F401
+        return
+    except ImportError:
+        pass
     aiofiles = types.ModuleType("aiofiles")
     aiofiles.__path__ = []  # type: ignore[attr-defined]
 

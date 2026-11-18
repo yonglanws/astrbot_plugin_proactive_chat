@@ -26,13 +26,17 @@ class RecordStage(BaseStage):
         session_id = ctx.session_id
         extra = getattr(ctx, "extra", {}) or {}
 
+        delivered_text = extra.get("delivered_text")
+        if not isinstance(delivered_text, str) or not delivered_text.strip():
+            delivered_text = extra.get("response_text", "")
+
         await self.orchestrator.finalize_and_reschedule(
             session_id,
             ctx.conversation_id,
-            extra.get("final_user_prompt", ""),
-            extra.get("response_text", ""),
+            delivered_text,
             ctx.unanswered_count,
             intent=extra.get("intent"),
+            started_at=getattr(ctx, "started_at", None),
         )
         return StageResult.CONTINUE
 

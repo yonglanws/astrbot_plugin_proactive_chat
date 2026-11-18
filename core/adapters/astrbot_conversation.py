@@ -8,11 +8,32 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections import OrderedDict
 from typing import Any
 
 from astrbot.api import logger
 
 from ..domain.content_text import reduce_record_text
+
+_CONV_LOCKS: OrderedDict[str, asyncio.Lock] = OrderedDict()
+_MAX_CONV_LOCKS = 512
+
+
+def _get_conv_lock(conv_id: str) -> asyncio.Lock:
+    key = str(conv_id)
+    lock = _CONV_LOCKS.get(key)
+    if lock is not None:
+        _CONV_LOCKS.move_to_end(key)
+        return lock
+    lock = asyncio.Lock()
+    _CONV_LOCKS[key] = lock
+    if len(_CONV_LOCKS) > _MAX_CONV_LOCKS:
+        for old_key in list(_CONV_LOCKS.keys()):
+            if old_key != key and not _CONV_LOCKS[old_key].locked():
+                _CONV_LOCKS.pop(old_key, None)
+                if len(_CONV_LOCKS) <= _MAX_CONV_LOCKS:
+                    break
+    return lock
 
 try:  # pragma: no cover - 取决于 AstrBot 版本
     from astrbot.core.agent.message import (
@@ -90,6 +111,57 @@ async def add_message_pair(
         cid=conv_id,
         user_message=user_msg_obj,
         assistant_message=assistant_msg_obj,
+    )
+
+
+async def add_assistant_message(
+    conversation_manager: Any,
+    conv_id: str,
+    assistant_response: str,
+) -> None:
+    """只把主动消息作为 assistant 记录存档，不再伪造 user 消息。
+
+    旧实现会把替换后的完整主动提示词当作 user 消息写入 AstrBot 对话历史，
+    既污染 Dashboard 与后续上下文，也浪费大量 token。优先直接追加 assistant
+    记录；极旧 AstrBot 缺少 DB 接口时才退回“短占位 user + assistant”的兼容写法。
+    """
+    if AssistantMessageSegment is None or TextPart is None:
+        raise RuntimeError("当前 AstrBot 版本缺少消息段 API")
+
+    assistant_msg_obj = AssistantMessageSegment(
+        content=[TextPart(text=assistant_response)]
+    )
+    assistant_msg_dict = assistant_msg_obj.model_dump()
+
+    db = getattr(conversation_manager, "db", None)
+    get_conversation = getattr(db, "get_conversation_by_id", None)
+    update_conversation = getattr(db, "update_conversation", None)
+    if callable(get_conversation) and callable(update_conversation):
+        async with _get_conv_lock(conv_id):
+            conversation = await get_conversation(cid=conv_id)
+            if not conversation:
+                raise RuntimeError(f"Conversation with id {conv_id} not found")
+            history = getattr(conversation, "content", None) or []
+            if isinstance(history, str):
+                try:
+                    history = await asyncio.to_thread(json.loads, history)
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning("[主动消息] 存档前解析对话历史 JSON 失败，将重置为列表喵。")
+                    history = []
+            if not isinstance(history, list):
+                history = []
+            else:
+                history = list(history)
+            history.append(assistant_msg_dict)
+            await update_conversation(cid=conv_id, content=history)
+        return
+
+    # 兼容兜底：使用极短占位符，绝不写入完整系统提示词。
+    await add_message_pair(
+        conversation_manager,
+        conv_id,
+        "[主动消息]",
+        assistant_response,
     )
 
 

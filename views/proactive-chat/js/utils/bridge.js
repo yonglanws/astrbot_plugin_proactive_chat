@@ -123,6 +123,7 @@
             if (path === '/api/status') return api.apiGet('status');
             if (path === '/api/config') return api.apiGet('config');
             if (path === '/api/config-schema') return api.apiGet('config-schema');
+            if (path === '/api/providers') return api.apiGet('providers');
             if (path === '/api/session-config/sessions') return api.apiGet('sessions');
             if (path === '/api/jobs') return api.apiGet('jobs');
             if (path === '/api/intensity') return api.apiGet('intensity');

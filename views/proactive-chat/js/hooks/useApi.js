@@ -12,6 +12,8 @@
         getStatus: () => HttpUtil.get('/api/status'),
         getConfig: () => HttpUtil.get('/api/config'),
         getConfigSchema: () => HttpUtil.get('/api/config-schema'),
+        // AstrBot 已加载的聊天 Provider 列表，用于配置页下拉选择。
+        getProviders: () => HttpUtil.get('/api/providers'),
         // 全局配置保存接口，传入完整 payload 由后端按分组白名单更新。
         updateConfig: (payload) => HttpUtil.post('/api/config', payload),
 

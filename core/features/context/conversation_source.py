@@ -29,7 +29,11 @@ class ContextStage(BaseStage):
         plugin = self.orchestrator.plugin
         session_id = ctx.session_id
 
-        request_package = await plugin.context_service.prepare_llm_request(session_id)
+        request_package = await plugin.context_service.prepare_llm_request(
+            session_id,
+            intensity_snapshot=(ctx.extra or {}).get("intensity"),
+            unanswered_count=ctx.unanswered_count,
+        )
         if not request_package:
             ctx.abort("context_prepare_failed")
             return StageResult.RESCHEDULE
@@ -37,6 +41,9 @@ class ContextStage(BaseStage):
         # 记录准备结果，供后续阶段消费。
         ctx.conversation_id = request_package["conv_id"]
         ctx.extra["history"] = request_package["history"]
+        ctx.extra["raw_history"] = request_package.get(
+            "raw_history", request_package["history"]
+        )
         ctx.extra["system_prompt"] = request_package["system_prompt"]
         ctx.extra["platform_context"] = request_package.get("platform_context", "")
         ctx.extra["conversation"] = request_package.get("conversation")
@@ -45,61 +52,79 @@ class ContextStage(BaseStage):
         effective_session_id = plugin.session_service.normalize_session_id(
             request_package.get("session_id", session_id)
         )
-        humanization: dict[str, Any] = {
-            "intent": ctx.extra.get("intent", ""),
-            "intent_brief": ctx.extra.get("intent_brief", ""),
-            "intent_label": (
-                (ctx.extra.get("intent_decision") or {}).get("intent_label", "")
-            ),
-        }
+        ctx.extra["request_session_id"] = effective_session_id
+        humanization: dict[str, Any] = dict(ctx.extra.get("humanization") or {})
+        humanization.setdefault("intent", ctx.extra.get("intent", ""))
+        humanization.setdefault("intent_brief", ctx.extra.get("intent_brief", ""))
+        humanization.setdefault(
+            "intent_label",
+            (ctx.extra.get("intent_decision") or {}).get("intent_label", ""),
+        )
+        if request_package.get("persona_name"):
+            humanization["persona_name"] = request_package["persona_name"]
+
         session_config = (
             plugin.config_service.get_session_config(effective_session_id) or {}
         )
-        try:
-            humanization["conversation_state"] = (
-                plugin.conversation_state_service.snapshot(
-                    effective_session_id, session_config=session_config
-                )
-            )
-        except Exception:
-            humanization["conversation_state"] = {}
-        try:
-            humanization["rhythm"] = plugin.rhythm_service.snapshot(
-                effective_session_id, session_config=session_config
-            )
-        except Exception:
-            humanization["rhythm"] = {}
-        try:
-            humanization["persona"] = plugin.persona_state_service.snapshot(
-                effective_session_id, session_config=session_config
-            )
-        except Exception:
-            humanization["persona"] = {}
+        state_session_id = session_id
 
-        topic_context = ""
-        conversation_memory = getattr(plugin, "conversation_memory_service", None)
-        if conversation_memory is not None:
+        async def _collect_humanization_locked() -> str:
             try:
-                conversation_memory.seed_from_history(
-                    effective_session_id,
-                    request_package.get("history", []),
-                    now=time.time(),
-                    session_config=session_config,
+                humanization["conversation_state"] = (
+                    plugin.conversation_state_service.snapshot(
+                        state_session_id, session_config=session_config
+                    )
                 )
-                humanization["conversation_memory"] = (
-                    conversation_memory.snapshot(
-                        effective_session_id,
+            except Exception:
+                humanization["conversation_state"] = {}
+            try:
+                humanization["rhythm"] = plugin.rhythm_service.snapshot(
+                    state_session_id, session_config=session_config
+                )
+            except Exception:
+                humanization["rhythm"] = {}
+            try:
+                humanization["persona"] = plugin.persona_state_service.snapshot(
+                    state_session_id, session_config=session_config
+                )
+            except Exception:
+                humanization["persona"] = {}
+
+            local_topic_context = ""
+            conversation_memory = getattr(plugin, "conversation_memory_service", None)
+            if conversation_memory is not None:
+                try:
+                    seed_source = request_package.get(
+                        "raw_history"
+                    ) or request_package.get("history", [])
+                    conversation_memory.seed_from_history(
+                        state_session_id,
+                        seed_source,
+                        now=time.time(),
+                        session_config=session_config,
+                    )
+                    humanization["conversation_memory"] = (
+                        conversation_memory.snapshot(
+                            state_session_id,
+                            session_config=session_config,
+                            now=time.time(),
+                        )
+                    )
+                    local_topic_context = conversation_memory.format_for_prompt(
+                        state_session_id,
                         session_config=session_config,
                         now=time.time(),
                     )
-                )
-                topic_context = conversation_memory.format_for_prompt(
-                    effective_session_id,
-                    session_config=session_config,
-                    now=time.time(),
-                )
-            except Exception as e:
-                logger.debug(f"[主动消息] 构建话题账本失败喵: {e}")
+                except Exception as e:
+                    logger.debug(f"[主动消息] 构建话题账本失败喵: {e}")
+            return local_topic_context
+
+        lock = getattr(plugin, "data_lock", None)
+        if lock is not None:
+            async with lock:
+                topic_context = await _collect_humanization_locked()
+        else:
+            topic_context = await _collect_humanization_locked()
         ctx.extra["topic_context"] = topic_context
 
         memory_context = ""
@@ -107,7 +132,8 @@ class ContextStage(BaseStage):
         if memory_bridge is not None:
             try:
                 query = self.build_memory_query(
-                    request_package.get("history", []),
+                    request_package.get("history", [])
+                    or request_package.get("raw_history", []),
                     humanization,
                 )
                 persona_id = getattr(
@@ -125,21 +151,12 @@ class ContextStage(BaseStage):
         ctx.extra["memory_context"] = memory_context
         ctx.extra["humanization"] = humanization
 
-        # 会话标识最终确定后再次规范化，确保事件构造、last_message_times 与
-        # session_data 读取键全局一致（与旧实现完全相同）。
-        request_session_id = plugin.session_service.normalize_session_id(
-            request_package.get("session_id", session_id)
-        )
-        ctx.session_id = request_session_id
-        ctx.session = plugin.session_service.build_session_key(request_session_id)
-        ctx.event = plugin.sender_service.build_proactive_event(request_session_id)
+        # 保持 ctx.session_id 与入口锁/start_state 一致，不中途覆盖。
+        ctx.session = plugin.session_service.build_session_key(ctx.session_id)
+        ctx.event = plugin.sender_service.build_proactive_event(ctx.session_id)
 
-        # 记录任务开始状态快照，用于检测 LLM 生成窗口内是否出现用户新消息。
-        ctx.start_state = {
-            "last_message_time": plugin.last_message_times.get(request_session_id, 0),
-            "unanswered_count": ctx.unanswered_count,
-            "timestamp": time.time(),
-        }
+        # start_state 已在流水线起点记录；这里不再覆盖，否则 GATE -> CONTEXT
+        # 之间到达的用户消息会被当成新的基线而漏检。
         logger.debug("[主动消息] 上下文准备完成喵。")
         return StageResult.CONTINUE
 

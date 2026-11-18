@@ -16,14 +16,23 @@ from astrbot.api import logger
 class TokenAuth:
     """负责登录令牌的签发、校验与过期清理。"""
 
-    def __init__(self, auth_enabled_provider: Callable[[], bool] | bool) -> None:
+    DEFAULT_MAX_TOKENS = 256
+
+    def __init__(
+        self,
+        auth_enabled_provider: Callable[[], bool] | bool,
+        *,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+    ) -> None:
         # 鉴权启用状态提供者：优先传回调动态读取当前密码，改密码后即时生效。
         self._auth_enabled_provider = auth_enabled_provider
         # 令牌有效期：24 小时。
         self._token_expire_seconds = 60 * 60 * 24
-        # token -> 过期时间戳 的映射。
+        # 令牌表容量上限，防止长期运行或高频登录导致内存无限增长。
+        self._max_tokens = max(1, int(max_tokens))
+        # token -> 过期时间戳 的映射（保持插入顺序以支持最旧淘汰）。
         self._tokens: dict[str, float] = {}
-        self._token_cleanup_task: asyncio.Task | None = None
+        self._token_cleanup_task: asyncio.Task[None] | None = None
 
     @property
     def enabled(self) -> bool:
@@ -35,10 +44,24 @@ class TokenAuth:
             return False
         return bool(result)
 
+    def _evict_if_needed(self, now: float) -> None:
+        """先清理过期令牌，若仍超出容量上限则淘汰最早签发的令牌。"""
+        expired = [k for k, exp in list(self._tokens.items()) if now > exp]
+        for k in expired:
+            self._tokens.pop(k, None)
+
+        while len(self._tokens) >= self._max_tokens:
+            oldest_key = next(iter(self._tokens), None)
+            if oldest_key is None:
+                break
+            self._tokens.pop(oldest_key, None)
+
     def issue_token(self) -> str:
         """签发一个新的随机令牌并记录其过期时间。"""
+        now = time.time()
+        self._evict_if_needed(now)
         token = secrets.token_urlsafe(24)
-        self._tokens[token] = time.time() + self._token_expire_seconds
+        self._tokens[token] = now + self._token_expire_seconds
         return token
 
     def verify_token(self, token: str) -> bool:
@@ -62,7 +85,7 @@ class TokenAuth:
             try:
                 await asyncio.sleep(3600)
                 now = time.time()
-                expired = [k for k, v in self._tokens.items() if now > v]
+                expired = [k for k, v in list(self._tokens.items()) if now > v]
                 for k in expired:
                     self._tokens.pop(k, None)
                 if expired:
@@ -79,10 +102,24 @@ class TokenAuth:
         故无条件启动清理循环，仅负责清理过期令牌，开销可忽略。
         """
         if self._token_cleanup_task is None or self._token_cleanup_task.done():
-            self._token_cleanup_task = asyncio.create_task(self._cleanup_tokens_loop())
+            task = asyncio.create_task(self._cleanup_tokens_loop())
+            self._token_cleanup_task = task
+
+            def _clear_done_ref(done_task: asyncio.Task[None]) -> None:
+                if self._token_cleanup_task is done_task:
+                    self._token_cleanup_task = None
+
+            task.add_done_callback(_clear_done_ref)
 
     async def stop_cleanup(self) -> None:
-        """取消令牌清理任务。"""
-        if self._token_cleanup_task:
-            self._token_cleanup_task.cancel()
-            self._token_cleanup_task = None
+        """取消并等待令牌清理任务退出。"""
+        task = self._token_cleanup_task
+        self._token_cleanup_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.debug(f"[主动消息] 停止令牌清理任务异常喵: {e}")

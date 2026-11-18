@@ -12,6 +12,8 @@
         const [sessionLoading, setSessionLoading] = useState(false);
         const [sessionConfigState, setSessionConfigState] = useState({ baseAvailable: true, message: '' });
         const [config, setConfig] = useState(null);
+        // AstrBot 已加载的聊天 Provider，供 topic_judge / planner / critic 专用 Provider 下拉使用。
+        const [providers, setProviders] = useState([]);
         const loadConfigSeqRef = useRef(0);
 
         const loadSessions = React.useCallback(async () => {
@@ -89,6 +91,24 @@
             }
         }, [api, schema]);
 
+        // Provider 列表与配置并行加载；失败时只影响下拉选项，不影响配置页主体。
+        useEffect(() => {
+            let disposed = false;
+            (async () => {
+                try {
+                    const result = await api.getProviders();
+                    if (disposed) return;
+                    setProviders(Array.isArray(result && result.providers) ? result.providers : []);
+                } catch (e) {
+                    if (!disposed) {
+                        console.error('加载 Provider 列表失败', e);
+                        setProviders([]);
+                    }
+                }
+            })();
+            return () => { disposed = true; };
+        }, [api]);
+
         // 首次进入页面：先拿 Schema，再准备会话列表。
         useEffect(() => {
             let disposed = false;
@@ -114,6 +134,7 @@
             schema: schema,
             config: config,
             setConfig: setConfig,
+            providers: providers,
             loading: loading,
             sessions: sessions,
             sessionLoading: sessionLoading,

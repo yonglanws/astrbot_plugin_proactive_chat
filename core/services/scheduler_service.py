@@ -20,6 +20,7 @@ from astrbot.api import logger
 
 from ..domain.domain_enums import TriggerSource
 from ..domain.session_key import is_friend_type
+from ..store.session_store import SessionStore
 
 # 未回复暂停状态字段（持久化在 session_data 中）。
 PAUSE_FLAG = "proactive_paused"
@@ -29,6 +30,17 @@ PAUSE_UNANSWERED = "paused_unanswered_count"
 PAUSE_THRESHOLD = "paused_threshold"
 PAUSE_REASON_MAX_UNANSWERED = "max_unanswered"
 COOLDOWN_UNTIL = "cooldown_until"
+SCHEDULE_CANCELLED_FLAG = "schedule_cancelled"
+
+
+def _safe_non_negative_int(value: Any, default: int) -> int:
+    """安全将配置或计数转为非负整数。"""
+    if isinstance(value, bool) or value is None:
+        return default
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return default
 
 
 class SchedulerService:
@@ -276,7 +288,13 @@ class SchedulerService:
         self.clear_session_schedule_state(session_id)
 
         try:
-            plugin.scheduler.remove_job(session_id)
+            if getattr(plugin, "scheduler", None) is not None:
+                plugin.scheduler.remove_job(session_id)
+        except Exception:
+            pass
+        try:
+            if getattr(plugin, "scheduler", None) is not None:
+                self.purge_related_jobs(session_id)
         except Exception:
             pass
 
@@ -315,6 +333,7 @@ class SchedulerService:
                 PAUSE_THRESHOLD,
             ):
                 info.pop(key, None)
+        info.pop(SCHEDULE_CANCELLED_FLAG, None)
         cleared_cooldown = False
         if clear_cooldown and COOLDOWN_UNTIL in info:
             info.pop(COOLDOWN_UNTIL, None)
@@ -327,6 +346,60 @@ class SchedulerService:
                 f"检测到用户重新开启话题，已解除未回复暂停喵。"
             )
         return True
+
+    async def cancel_session_schedule(self, session_id: str) -> bool:
+        """取消指定会话的调度任务与自动触发器，并持久化手动取消标记。
+
+        内部自行获取 ``plugin.data_lock``，避免调用方重复加锁导致重入死锁。
+        """
+        plugin = self.plugin
+        normalized = plugin.session_service.normalize_session_id(session_id)
+
+        removed_job = False
+        scheduler = getattr(plugin, "scheduler", None)
+        if scheduler is not None:
+            for candidate in {session_id, normalized}:
+                try:
+                    scheduler.remove_job(candidate)
+                    removed_job = True
+                except Exception:
+                    pass
+            try:
+                for job in list(scheduler.get_jobs()):
+                    job_id = str(job.id)
+                    job_parsed = plugin.session_service.parse_session_id(job_id)
+                    norm_parsed = plugin.session_service.parse_session_id(normalized)
+                    if not job_parsed or not norm_parsed:
+                        continue
+                    if (
+                        is_friend_type(job_parsed[1]) == is_friend_type(norm_parsed[1])
+                        and job_parsed[2] == norm_parsed[2]
+                    ):
+                        try:
+                            scheduler.remove_job(job.id)
+                            removed_job = True
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        cancelled_auto = await self.cancel_all_related_auto_triggers(normalized)
+        if normalized != session_id:
+            cancelled_auto = (
+                await self.cancel_all_related_auto_triggers(session_id)
+                or cancelled_auto
+            )
+
+        had_persisted = False
+        async with plugin.data_lock:
+            payload = plugin.session_data.setdefault(normalized, {})
+            if isinstance(payload, dict):
+                had_persisted = "next_trigger_time" in payload
+                self.clear_session_schedule_state(normalized)
+                payload[SCHEDULE_CANCELLED_FLAG] = True
+            await plugin.storage_service.save_data()
+
+        return bool(removed_job or had_persisted or cancelled_auto)
 
     # ------------------------------------------------------------------
     # 调度时间计算（全项目唯一来源）
@@ -630,9 +703,12 @@ class SchedulerService:
             return "existing"
 
         schedule_conf = session_config.get("schedule_settings", {})
-        max_unanswered = schedule_conf.get("max_unanswered_times", 4)
-        unanswered_count = plugin.session_data.get(resolved_session_id, {}).get(
-            "unanswered_count", 0
+        max_unanswered = _safe_non_negative_int(
+            schedule_conf.get("max_unanswered_times", 4), 4
+        )
+        unanswered_count = _safe_non_negative_int(
+            plugin.session_data.get(resolved_session_id, {}).get("unanswered_count", 0),
+            0,
         )
         if max_unanswered > 0 and unanswered_count >= max_unanswered:
             logger.info(
@@ -658,6 +734,7 @@ class SchedulerService:
         """从已加载的 session_data 中恢复私聊定时任务。"""
         plugin = self.plugin
         restored_count = 0
+        rescheduled_count = 0
         cleaned_runtime_state = 0
         current_time = time.time()
 
@@ -665,20 +742,25 @@ class SchedulerService:
             f"[主动消息] 开始从数据恢复定时任务喵，当前时间: {datetime.fromtimestamp(current_time)}"
         )
 
-        cleaned_count = self.plugin.storage_service.cleanup_invalid_session_data()
-        if cleaned_count > 0:
-            logger.info(f"[主动消息] 清理了 {cleaned_count} 个无效的会话数据条目喵。")
-            async with plugin.data_lock:
+        async with plugin.data_lock:
+            cleaned_count = self.plugin.storage_service.cleanup_invalid_session_data()
+            if cleaned_count > 0:
+                logger.info(f"[主动消息] 清理了 {cleaned_count} 个无效的会话数据条目喵。")
                 await plugin.storage_service.save_data()
+            session_entries = [
+                (sid, dict(info) if isinstance(info, dict) else {})
+                for sid, info in plugin.session_data.items()
+            ]
 
-        logger.debug(f"[主动消息] 会话数据条目数: {len(plugin.session_data)}")
+        logger.debug(f"[主动消息] 会话数据条目数: {len(session_entries)}")
 
-        for session_id, session_info in list(plugin.session_data.items()):
+        for session_id, session_info in session_entries:
             parsed = plugin.session_service.parse_session_id(session_id)
-            # 历史数据里可能残留群聊会话：清理调度状态后跳过。
+            # 历史数据里可能残留非私聊会话：清理调度状态后跳过。
             if parsed and not is_friend_type(parsed[1]):
-                if self.clear_session_schedule_state(session_id):
-                    cleaned_runtime_state += 1
+                async with plugin.data_lock:
+                    if self.clear_session_schedule_state(session_id):
+                        cleaned_runtime_state += 1
                 logger.info(
                     f"[主动消息] 跳过非私聊历史数据喵: {session_id}"
                 )
@@ -686,36 +768,76 @@ class SchedulerService:
 
             session_config = plugin.config_service.get_session_config(session_id)
             if not session_config or not session_config.get("enable", False):
-                if self.clear_session_schedule_state(session_id):
-                    cleaned_runtime_state += 1
-                    logger.info(
-                        f"[主动消息] {plugin.session_service.get_session_log_str(session_id, session_config)} 的配置无效或已禁用，已清理残留调度状态喵。"
-                    )
+                async with plugin.data_lock:
+                    if self.clear_session_schedule_state(session_id):
+                        cleaned_runtime_state += 1
+                        logger.info(
+                            f"[主动消息] {plugin.session_service.get_session_log_str(session_id, session_config)} 的配置无效或已禁用，已清理残留调度状态喵。"
+                        )
                 continue
 
             if self.is_session_paused(session_id):
-                if self.clear_session_schedule_state(session_id):
-                    cleaned_runtime_state += 1
+                async with plugin.data_lock:
+                    if self.clear_session_schedule_state(session_id):
+                        cleaned_runtime_state += 1
                 logger.info(
                     f"[主动消息] {plugin.session_service.get_session_log_str(session_id, session_config)} 处于未回复暂停中，等待用户重新开启话题，不恢复任务喵。"
                 )
                 continue
 
-            next_trigger = session_info.get("next_trigger_time")
-            if not next_trigger:
-                logger.debug(
-                    f"[主动消息] {plugin.session_service.get_session_log_str(session_id, session_config)} 没有next_trigger_time，跳过喵"
+            schedule_conf = session_config.get("schedule_settings", {})
+            max_unanswered = _safe_non_negative_int(
+                schedule_conf.get("max_unanswered_times", 4), 4
+            )
+            unanswered_count = _safe_non_negative_int(
+                session_info.get("unanswered_count", 0), 0
+            )
+            if max_unanswered > 0 and unanswered_count >= max_unanswered:
+                logger.info(
+                    f"[主动消息] {plugin.session_service.get_session_log_str(session_id, session_config)} "
+                    f"启动恢复检测到未回复次数 ({unanswered_count}) 已达上限 ({max_unanswered})，立即暂停喵。"
                 )
+                async with plugin.data_lock:
+                    await self.pause_session(
+                        session_id,
+                        threshold=max_unanswered,
+                        unanswered_count=unanswered_count,
+                    )
+                continue
+
+            next_trigger = session_info.get("next_trigger_time")
+            if session_info.get(SCHEDULE_CANCELLED_FLAG) and not next_trigger:
+                logger.info(
+                    f"[主动消息] {plugin.session_service.get_session_log_str(session_id, session_config)} 的任务已被手动取消，重启不自动重建喵。"
+                )
+                continue
+
+            if not next_trigger:
+                # 旧数据/异常退出可能没有 next_trigger_time。若直接跳过，
+                # 该会话会一直静默到用户下次发消息；这里主动补一次排期。
+                logger.info(
+                    f"[主动消息] {plugin.session_service.get_session_log_str(session_id, session_config)} 缺少 next_trigger_time，重新安排下一次主动消息喵。"
+                )
+                async with plugin.data_lock:
+                    if self.clear_session_schedule_state(session_id):
+                        cleaned_runtime_state += 1
+                await self.schedule_next_chat_and_save(session_id)
+                rescheduled_count += 1
                 continue
 
             if not self.is_persisted_task_still_valid(
                 session_id, session_info, current_time=current_time
             ):
+                # 重启时任务已经过期：不补发旧任务（避免突然轰炸），
+                # 而是按当前强度重新排期，保证不会永久沉默。
                 logger.info(
-                    f"[主动消息] {plugin.session_service.get_session_log_str(session_id, session_config)} 的持久化任务已过期或无效，清理后跳过恢复喵。"
+                    f"[主动消息] {plugin.session_service.get_session_log_str(session_id, session_config)} 的持久化任务已过期或无效，按当前配置重新排期喵。"
                 )
-                if self.clear_session_schedule_state(session_id):
-                    cleaned_runtime_state += 1
+                async with plugin.data_lock:
+                    if self.clear_session_schedule_state(session_id):
+                        cleaned_runtime_state += 1
+                await self.schedule_next_chat_and_save(session_id)
+                rescheduled_count += 1
                 continue
 
             try:
@@ -739,17 +861,19 @@ class SchedulerService:
                 logger.error(
                     f"[主动消息] 添加 {plugin.session_service.get_session_log_str(session_id, session_config)} 的恢复任务到调度器时失败喵: {e}"
                 )
-                if self.clear_session_schedule_state(session_id):
-                    cleaned_runtime_state += 1
+                async with plugin.data_lock:
+                    if self.clear_session_schedule_state(session_id):
+                        cleaned_runtime_state += 1
 
         if cleaned_runtime_state > 0:
             async with plugin.data_lock:
                 await plugin.storage_service.save_data()
 
         logger.info(
-            f"[主动消息] 任务恢复检查完成，共恢复 {restored_count} 个定时任务喵。"
+            f"[主动消息] 任务恢复检查完成，共恢复 {restored_count} 个定时任务，"
+            f"为 {rescheduled_count} 个缺失/过期任务重新排期喵。"
         )
-        if restored_count == 0:
+        if restored_count == 0 and rescheduled_count == 0:
             logger.info("[主动消息] 没有需要恢复的定时任务喵。")
 
     async def schedule_next_chat_and_save(
@@ -779,12 +903,6 @@ class SchedulerService:
         if not session_config:
             return
 
-        if self.is_session_paused(normalized_session_id):
-            logger.debug(
-                f"[主动消息] {plugin.session_service.get_session_log_str(normalized_session_id, session_config)} 处于未回复暂停中，拒绝安排下一次主动消息喵。"
-            )
-            return
-
         schedule_conf = session_config.get("schedule_settings", {})
 
         async with plugin.data_lock:
@@ -793,9 +911,18 @@ class SchedulerService:
                 and session_id in plugin.session_data
             ):
                 existing_payload = plugin.session_data.get(session_id, {})
-                plugin.session_data.setdefault(normalized_session_id, {}).update(
-                    existing_payload
-                )
+                current_payload = plugin.session_data.get(normalized_session_id)
+                if isinstance(current_payload, dict) and isinstance(existing_payload, dict):
+                    merge_fn = getattr(
+                        getattr(plugin, "storage_service", None),
+                        "merge_session_info",
+                        SessionStore.merge_session_info,
+                    )
+                    plugin.session_data[normalized_session_id] = merge_fn(
+                        current_payload, existing_payload
+                    )
+                elif isinstance(existing_payload, dict):
+                    plugin.session_data[normalized_session_id] = dict(existing_payload)
                 del plugin.session_data[session_id]
 
             if normalized_session_id != session_id:
@@ -804,10 +931,37 @@ class SchedulerService:
                 except Exception:
                     pass
 
+            if self.is_session_paused(normalized_session_id):
+                logger.debug(
+                    f"[主动消息] {plugin.session_service.get_session_log_str(normalized_session_id, session_config)} 处于未回复暂停中，拒绝安排下一次主动消息喵。"
+                )
+                return
+
             if reset_counter:
                 plugin.session_data.setdefault(normalized_session_id, {})[
                     "unanswered_count"
                 ] = 0
+            else:
+                max_unanswered = _safe_non_negative_int(
+                    schedule_conf.get("max_unanswered_times", 4), 4
+                )
+                current_unanswered = _safe_non_negative_int(
+                    plugin.session_data.get(normalized_session_id, {}).get(
+                        "unanswered_count", 0
+                    ),
+                    0,
+                )
+                if max_unanswered > 0 and current_unanswered >= max_unanswered:
+                    logger.info(
+                        f"[主动消息] {plugin.session_service.get_session_log_str(normalized_session_id, session_config)} "
+                        f"的未回复次数 ({current_unanswered}) 已达到上限 ({max_unanswered})，转为暂停状态并停止排期喵。"
+                    )
+                    await self.pause_session(
+                        normalized_session_id,
+                        threshold=max_unanswered,
+                        unanswered_count=current_unanswered,
+                    )
+                    return
 
             (
                 run_date,
@@ -826,6 +980,7 @@ class SchedulerService:
             self.add_chat_job(normalized_session_id, run_date)
 
             session_payload = plugin.session_data.setdefault(normalized_session_id, {})
+            session_payload.pop(SCHEDULE_CANCELLED_FLAG, None)
             session_payload["next_trigger_time"] = next_trigger_time
             session_payload["last_scheduled_at"] = scheduled_at
             session_payload["last_schedule_min_interval_seconds"] = min_interval
@@ -882,12 +1037,36 @@ class SchedulerService:
                 current_time = time.time()
                 time_since_plugin_start = current_time - plugin.plugin_start_time
 
-                if last_message_time != 0 or time_since_plugin_start < (
-                    auto_trigger_minutes * 60
+                if (
+                    last_message_time >= plugin.plugin_start_time
+                    or (
+                        last_message_time > 0
+                        and (current_time - last_message_time) < (auto_trigger_minutes * 60)
+                    )
+                    or time_since_plugin_start < (auto_trigger_minutes * 60)
                 ):
                     return
 
                 schedule_conf = current_config.get("schedule_settings", {})
+                max_unanswered = _safe_non_negative_int(
+                    schedule_conf.get("max_unanswered_times", 4), 4
+                )
+                unanswered_count = _safe_non_negative_int(
+                    plugin.session_data.get(session_id, {}).get("unanswered_count", 0),
+                    0,
+                )
+                if max_unanswered > 0 and unanswered_count >= max_unanswered:
+                    logger.info(
+                        f"[主动消息] {plugin.session_service.get_session_log_str(session_id, current_config)} "
+                        f"的未回复次数 ({unanswered_count}) 已达上限 ({max_unanswered})，取消自动触发并暂停喵。"
+                    )
+                    await self.pause_session(
+                        session_id,
+                        threshold=max_unanswered,
+                        unanswered_count=unanswered_count,
+                    )
+                    return
+
                 intensity_settings = plugin.intensity_service.get_settings(
                     current_config
                 )
@@ -901,7 +1080,7 @@ class SchedulerService:
                     min_interval,
                     max_interval,
                     random_interval,
-                    _next_trigger_time,
+                    next_trigger_time,
                     intensity_score,
                 ) = self.compute_next_trigger(
                     schedule_conf,
@@ -910,6 +1089,8 @@ class SchedulerService:
                 )
 
                 session_payload = plugin.session_data.setdefault(session_id, {})
+                session_payload.pop(SCHEDULE_CANCELLED_FLAG, None)
+                session_payload["next_trigger_time"] = next_trigger_time
                 session_payload["last_scheduled_at"] = scheduled_at
                 session_payload["last_schedule_min_interval_seconds"] = min_interval
                 session_payload["last_schedule_max_interval_seconds"] = max_interval
@@ -922,10 +1103,13 @@ class SchedulerService:
                 self.add_chat_job(
                     session_id, run_date, trigger=TriggerSource.AUTO_TRIGGER
                 )
+                storage_service = getattr(plugin, "storage_service", None)
+                if storage_service is not None:
+                    await storage_service.save_data()
 
                 logger.info(
                     f"[主动消息] {plugin.session_service.get_session_log_str(session_id, current_config)} 满足条件，自动触发任务已创建喵！"
-                    f"执行时间 (非持久化): {run_date.strftime('%Y-%m-%d %H:%M:%S')} 喵"
+                    f"执行时间: {run_date.strftime('%Y-%m-%d %H:%M:%S')} 喵"
                 )
         except Exception as e:
             logger.error(f"[主动消息] 自动触发任务创建失败喵: {e}")

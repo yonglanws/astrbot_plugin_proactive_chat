@@ -22,18 +22,24 @@ class TestReplyQuality:
     def test_negative_feedback(self):
         for text in ("别发了", "在忙，不要打扰", "stop messaging me"):
             assert classify_reply(text) is ReplyQuality.NEGATIVE
+        # 否定“忙/没空”的反例不应误判为负反馈。
+        assert classify_reply("之前一直没空，现在好了") is ReplyQuality.SUBSTANTIVE
 
     def test_perfunctory(self):
-        for text in ("嗯", "哦哦", "好", "😂", "……"):
+        for text in ("嗯", "哦哦", "好", "666", "收到啦", "好滴", "😂", "……"):
             assert classify_reply(text) is ReplyQuality.PERFUNCTORY
 
     def test_question(self):
         assert classify_reply("你明天有空吗？") is ReplyQuality.QUESTION
         assert classify_reply("为什么突然找我") is ReplyQuality.QUESTION
+        # 非疑问语气的“呢/怎么”不应误判为提问。
+        assert has_question("太累了呢") is False
+        assert has_question("不知道怎么选") is False
 
     def test_substantive(self):
         assert classify_reply("刚看完那部电影，结尾有点意外") is ReplyQuality.SUBSTANTIVE
         assert classify_reply("到了") is ReplyQuality.SUBSTANTIVE
+        assert classify_reply("晚安") is ReplyQuality.SUBSTANTIVE
 
     def test_media(self):
         assert classify_reply("", has_media=True) is ReplyQuality.MEDIA
@@ -73,12 +79,29 @@ class TestDeliveryPlan:
             rng=random.Random(7),
         )
         assert 2 <= len(plan.bubbles) <= 3
-        assert "".join(bubble.text for bubble in plan.bubbles).replace(" ", "") == text.replace(" ", "")
+        # <=22 字的短口语气泡会去掉末尾生硬句号，但完整内容应全部保留。
+        assert "".join(bubble.text.rstrip("。") for bubble in plan.bubbles).replace(
+            " ", ""
+        ) == text.replace("。", "").replace(" ", "")
+
+    def test_explicit_newline_splits_short_message(self):
+        plan = build_delivery_plan(
+            "刚下班\n今天好累呀！",
+            DeliveryPlanSettings(max_bubbles=3, bubble_length_threshold=60),
+            rng=random.Random(2),
+        )
+        assert [b.text for b in plan.bubbles] == ["刚下班", "今天好累呀！"]
 
     def test_voice_probability(self):
         settings = DeliveryPlanSettings(voice_probability=1.0)
         plan = build_delivery_plan("晚安", settings, voice_allowed=True)
         assert plan.voice is True
+
+    def test_voice_skips_url_code_and_emoji(self):
+        settings = DeliveryPlanSettings(voice_probability=1.0)
+        assert build_delivery_plan("看这个 https://example.com", settings, voice_allowed=True).voice is False
+        assert build_delivery_plan("```py\nprint(1)\n```", settings, voice_allowed=True).voice is False
+        assert build_delivery_plan("😂😂😂", settings, voice_allowed=True).voice is False
 
     def test_rich_chain(self):
         plan = build_delivery_plan(

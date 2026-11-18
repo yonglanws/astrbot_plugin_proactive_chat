@@ -20,8 +20,7 @@ http://127.0.0.1:4100
 }
 ```
 
-> 前端通过 CDN 加载 React 18、MUI 5、Babel Standalone、marked、DOMPurify、mermaid。
-> 国内时区/语言会自动使用 npmmirror，否则使用 unpkg。
+> 前端依赖（React 18、MUI 5、Emotion、marked、DOMPurify、mermaid）随插件放在 `views/proactive-chat/lib/`，离线/内网也能加载。源码开发态额外使用本地 Babel Standalone 编译 JSX；Release 包会预编译 JSX 并移除 Babel。
 
 ---
 
@@ -86,7 +85,7 @@ await window.AstrBotPluginView.apiPost("jobs/trigger", { umo });
 几个与独立 WebUI 不同的约束：
 
 - **鉴权**：由 AstrBot Dashboard 完成，页面内不再输入管理端密码；
-- **实时刷新**：受限 iframe 拿不到 Dashboard WebSocket 凭据，页面改用 3 秒轮询；
+- **实时刷新**：受限 iframe 拿不到 Dashboard WebSocket 凭据，页面改用 10 秒兜底轮询；
 - **存储**：iframe 没有 `allow-same-origin`，`localStorage` 会抛异常，前端统一使用 `StorageUtil` 内存降级；
 - **弹窗**：iframe 没有 `allow-modals`，`alert/confirm` 改为页面内对话框；
 - **资源路径**：只能使用视图目录内的相对路径，不能引用 `../logo.png` 等越界文件。
@@ -202,7 +201,7 @@ WebUI 是纯静态文件，没有构建步骤：
 
 ```text
 views/proactive-chat/
-  index.html          # 入口 + CDN 加载 + 脚本队列
+  index.html          # 入口 + 本地依赖加载 + 脚本队列
   css/                # 主题、布局、状态页、内容、强度页
                         # astrbot-page.css 为内嵌模式的 AstrBot Page 覆盖层
   js/

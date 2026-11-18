@@ -43,42 +43,21 @@
     <!-- AstrBot 插件页面覆盖层：必须在所有基础样式之后加载。 -->
     <link rel="stylesheet" href="css/astrbot-page.css">
 
-    <!-- 以 UMD 方式引入 React / Babel / MUI。
-         根据用户时区/语言自动选择 CDN：国内走 npmmirror，国外走 unpkg。 -->
+    <!-- 前端依赖全部随插件本地分发，离线/内网/CDN 不可达时仍能正常加载。
+         仅开发态需要 Babel Standalone 在浏览器里编译 JSX；Release 打包会
+         预编译 JSX 并移除 Babel 依赖。 -->
     <script>
     (function() {
-        // 通过时区和语言判断是否为国内用户，安全降级到 unpkg。
-        var tz = '';
-        try {
-            if (typeof Intl !== 'undefined' && Intl.DateTimeFormat) {
-                tz = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
-            }
-        } catch (e) {}
-        var lang = (navigator.language || '').toLowerCase();
-        var isCN = tz === 'Asia/Shanghai' || tz === 'Asia/Chongqing' || tz === 'Asia/Urumqi'
-                || lang === 'zh-cn';
-
-        var base = isCN ? 'https://registry.npmmirror.com' : 'https://unpkg.com';
-        var libs = isCN ? [
-            '/react/18.2.0/files/umd/react.production.min.js',
-            '/react-dom/18.2.0/files/umd/react-dom.production.min.js',
-            '/@babel/standalone/7.25.6/files/babel.min.js',
-            '/@mui/material/5.16.7/files/umd/material-ui.production.min.js',
-            '/@emotion/react/11.13.3/files/dist/emotion-react.umd.min.js',
-            '/@emotion/styled/11.13.0/files/dist/emotion-styled.umd.min.js',
-            '/marked/14.1.2/files/marked.min.js',
-            '/dompurify/3.1.6/files/dist/purify.min.js',
-            '/mermaid/11.4.1/files/dist/mermaid.min.js'
-        ] : [
-            '/react@18.2.0/umd/react.production.min.js',
-            '/react-dom@18.2.0/umd/react-dom.production.min.js',
-            '/@babel/standalone@7.25.6/babel.min.js',
-            '/@mui/material@5.16.7/umd/material-ui.production.min.js',
-            '/@emotion/react@11.13.3/dist/emotion-react.umd.min.js',
-            '/@emotion/styled@11.13.0/dist/emotion-styled.umd.min.js',
-            '/marked@14.1.2/marked.min.js',
-            '/dompurify@3.1.6/dist/purify.min.js',
-            '/mermaid@11.4.1/dist/mermaid.min.js'
+        var libs = [
+            './lib/react.js',
+            './lib/react-dom.js',
+            './lib/babel.min.js',
+            './lib/mui.js',
+            './lib/emotion-react.js',
+            './lib/emotion-styled.js',
+            './lib/marked.min.js',
+            './lib/purify.min.js',
+            './lib/mermaid.min.js'
         ];
 
         // 命名空间收拢，避免污染 window 全局变量并方便调试
@@ -209,9 +188,8 @@
         var head = document.head || document.getElementsByTagName('head')[0];
         for (var i = 0; i < libs.length; i++) {
             var s = document.createElement('script');
-            s.src = base + libs[i];
+            s.src = libs[i];
             s.async = false; // 强迫动态脚本按数组中的逻辑顺序同步下载并执行
-            if (i < 2) s.crossOrigin = 'anonymous';
             s.onload = s.onerror = function() {
                 window.ProactiveLoader.libsLoaded++;
                 window.ProactiveLoader.triggerPendingScripts();

@@ -70,6 +70,9 @@ def build_generation_context(ctx: Any) -> str:
     extra = ctx.extra or {}
     humanization = extra.get("humanization") or {}
     lines: list[str] = []
+    system_prompt = str(extra.get("system_prompt") or "").strip()
+    if system_prompt:
+        lines.append(f"当前人格设定摘要：\n{system_prompt[:600]}")
     intent_label = humanization.get("intent_label")
     if intent_label:
         lines.append(f"本轮意图：{intent_label}")

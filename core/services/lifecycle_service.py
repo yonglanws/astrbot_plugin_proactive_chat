@@ -43,6 +43,11 @@ class LifecycleService:
 
         plugin.data_lock = asyncio.Lock()
 
+        override_mgr = getattr(plugin, "session_override_manager", None)
+        set_normalizer = getattr(override_mgr, "set_normalizer", None)
+        if callable(set_normalizer):
+            set_normalizer(plugin.session_service.normalize_session_id)
+
         try:
             await plugin.config_service.validate_config()
         except Exception as e:
@@ -62,6 +67,13 @@ class LifecycleService:
                 page_api.register()
             except Exception as e:
                 logger.warning(f"[主动消息] 注册插件页面 API 失败喵: {e}")
+
+        # 检查当前 bot 配置的 plugin_set 是否包含本插件。AstrBot 只会把
+        # AdapterMessageEvent 分发给白名单内插件，但 OnAstrBotLoadedEvent
+        # 不受限制，因此漏选时插件看似“运行中”，私聊消息监听器却完全不执行。
+        plugin.plugin_set_warning = self.detect_plugin_set_warning()
+        if plugin.plugin_set_warning:
+            logger.warning(f"[主动消息] {plugin.plugin_set_warning}")
 
         # 解析时区；无效配置回退为服务器系统时区（None）。
         try:
@@ -149,6 +161,27 @@ class LifecycleService:
             except Exception as e:
                 logger.debug(f"[主动消息] 探测长期记忆插件失败喵: {e}")
 
+    def detect_plugin_set_warning(self) -> str:
+        """检测 bot 级 plugin_set 是否漏选本插件。"""
+        plugin = self.plugin
+        try:
+            astrbot_config = plugin.context.get_config()
+            plugin_set = astrbot_config.get("plugin_set", ["*"])
+        except Exception:
+            return ""
+
+        if not isinstance(plugin_set, list) or "*" in plugin_set:
+            return ""
+        plugin_name = "astrbot_plugin_proactive_chat"
+        if plugin_name in {str(item) for item in plugin_set}:
+            return ""
+
+        return (
+            "当前 bot 配置的 plugin_set 未包含 astrbot_plugin_proactive_chat，"
+            "AstrBot 会过滤本插件的私聊消息监听器：插件仍能启动并发送主动消息，"
+            "但用户的回复不会被记录。请到 AstrBot 管理面板的 bot 配置中勾选本插件后重载。"
+        )
+
     def are_platforms_available(self) -> bool:
         """判断是否已有可用的 IM 平台适配器实例。"""
         try:
@@ -161,7 +194,8 @@ class LifecycleService:
         """在平台适配器就绪后完成依赖平台的启动流程。
 
         使用双重检查加锁，保证初始化的重活只执行一次；
-        allow_retry 为 True 时不锁定完成标记，允许后续再次尝试。
+        allow_retry 为 True（超时兜底）时仅在当前确实无可用平台时允许后续
+        平台就绪后重试一次，避免同一状态下重复初始化。
         """
         plugin = self.plugin
         if plugin._startup_finalized or getattr(plugin, "_terminating", False):
@@ -171,15 +205,27 @@ class LifecycleService:
             if plugin._startup_finalized or getattr(plugin, "_terminating", False):
                 return
 
+            platforms_ready = self.are_platforms_available()
+            if (
+                allow_retry
+                and not platforms_ready
+                and getattr(plugin, "_startup_attempted_without_platforms", False)
+            ):
+                return
+            if (
+                not platforms_ready
+                and getattr(plugin, "_startup_attempted_without_platforms", False)
+            ):
+                return
+
             # 先规范化历史会话键，再恢复消息时间与调度任务。
             async with plugin.data_lock:
                 if plugin.storage_service.normalize_session_data():
                     await plugin.storage_service.save_data()
+                self.restore_last_message_times()
 
             if getattr(plugin, "_terminating", False):
                 return
-
-            self.restore_last_message_times()
 
             await plugin.scheduler_service.init_jobs_from_data()
             logger.info("[主动消息] 调度器已初始化喵。")
@@ -190,23 +236,40 @@ class LifecycleService:
             await plugin.scheduler_service.setup_auto_triggers_for_enabled_sessions()
             logger.info("[主动消息] 自动主动消息触发器初始化完成喵。")
 
-            if not allow_retry:
+            if platforms_ready or not allow_retry:
                 plugin._startup_finalized = True
+            else:
+                plugin._startup_attempted_without_platforms = True
 
     def restore_last_message_times(self) -> None:
-        """从持久化数据恢复插件启动后的会话消息时间（用于自动触发判定）。"""
+        """从持久化数据恢复近期会话消息时间（用于自动触发与重启衔接）。"""
         plugin = self.plugin
         restored_count = 0
-        for session_id, session_info in plugin.session_data.items():
+        for session_id, session_info in list(plugin.session_data.items()):
             if not isinstance(session_info, dict):
                 continue
             last_time = session_info.get("last_message_time")
             if not isinstance(last_time, (int, float)) or last_time <= 0:
                 continue
 
-            if last_time < plugin.plugin_start_time:
+            # 保留启动后以及启动前近期（默认 1 小时或会话配置的自动触发窗口）内的消息时间，
+            # 防止重启/重载前刚刚聊过天的用户被误判为“一直未发言”。
+            recent_window = 3600.0
+            try:
+                cfg = plugin.config_service.get_session_config(session_id) or {}
+                auto_minutes = int(
+                    (cfg.get("auto_trigger_settings") or {}).get(
+                        "auto_trigger_after_minutes", 5
+                    )
+                    or 5
+                )
+                recent_window = max(recent_window, auto_minutes * 60.0)
+            except Exception:
+                pass
+
+            if last_time < (plugin.plugin_start_time - recent_window):
                 logger.debug(
-                    f"[主动消息] 忽略插件启动前的历史消息时间用于自动主动消息任务喵: "
+                    f"[主动消息] 忽略过早的历史消息时间用于自动主动消息任务喵: "
                     f"{plugin.session_service.get_session_log_str(session_id)} -> {last_time}"
                 )
                 continue
@@ -214,22 +277,26 @@ class LifecycleService:
             normalized_session_id = plugin.session_service.normalize_session_id(
                 session_id
             )
-            plugin.last_message_times[normalized_session_id] = last_time
+            plugin.last_message_times[normalized_session_id] = float(last_time)
             restored_count += 1
             logger.debug(
                 f"[主动消息] 已恢复 {plugin.session_service.get_session_log_str(session_id)} "
-                f"在插件启动后的消息时间喵 -> {last_time}"
+                f"的近期消息时间喵 -> {last_time}"
             )
 
         if restored_count > 0:
             logger.info(
-                f"[主动消息] 已从持久化数据恢复 {restored_count} 个会话在插件启动后的消息时间喵。"
+                f"[主动消息] 已从持久化数据恢复 {restored_count} 个会话的近期消息时间喵。"
             )
 
     async def on_astrbot_loaded(self) -> None:
         """AstrBot 加载完成回调：平台已加载，恢复持久化定时任务。"""
 
         try:
+            warning = self.detect_plugin_set_warning()
+            self.plugin.plugin_set_warning = warning
+            if warning:
+                logger.warning(f"[主动消息] {warning}")
             await self.finalize_startup()
         except Exception:
             logger.error(
@@ -270,6 +337,15 @@ class LifecycleService:
 
         # 先置位终止标记，后续流程据此提前退出。
         plugin._terminating = True
+
+        # 移除注册到 AstrBot 的页面 API，避免旧实例路由残留。
+        page_api = getattr(plugin, "page_api", None)
+        unregister = getattr(page_api, "unregister", None)
+        if callable(unregister):
+            try:
+                unregister()
+            except Exception as e:
+                logger.warning(f"[主动消息] 移除插件页面 API 失败喵: {e}")
 
         startup_task = getattr(plugin, "_startup_task", None)
         plugin._startup_task = None
@@ -321,7 +397,24 @@ class LifecycleService:
                     )
                 except Exception as e:
                     logger.debug(f"[主动消息] shutdown 遥测上报失败喵: {e}")
-                await plugin._cleanup_telemetry_tasks()
+
+            # 无论遥测是否启用，都必须清理并等待通过 _track_task 登记的后台任务
+            # （含手动触发、自动触发回调等），防止卸载/重载后游离任务继续修改状态。
+            cleanup_tasks = getattr(plugin, "_cleanup_telemetry_tasks", None)
+            if callable(cleanup_tasks):
+                await cleanup_tasks()
+
+            if plugin.web_admin_server:
+                try:
+                    await plugin.web_admin_server.stop()
+                except Exception as e:
+                    logger.warning(f"[主动消息] 停止 Web 管理端时出错喵: {e}")
+
+            if plugin.notification_center:
+                try:
+                    await plugin.notification_center.stop()
+                except Exception as e:
+                    logger.warning(f"[主动消息] 停止通知系统时出错喵: {e}")
 
             if plugin._exception_handler_installed:
                 loop = asyncio.get_running_loop()
@@ -336,18 +429,6 @@ class LifecycleService:
                     logger.info("[主动消息] 会话数据已保存喵。")
                 except Exception as e:
                     logger.error(f"[主动消息] 保存数据时出错喵: {e}")
-
-            if plugin.web_admin_server:
-                try:
-                    await plugin.web_admin_server.stop()
-                except Exception as e:
-                    logger.warning(f"[主动消息] 停止 Web 管理端时出错喵: {e}")
-
-            if plugin.notification_center:
-                try:
-                    await plugin.notification_center.stop()
-                except Exception as e:
-                    logger.warning(f"[主动消息] 停止通知系统时出错喵: {e}")
         except Exception as e:
             logger.error(f"[主动消息] 生命周期终止阶段发生异常喵: {e}")
             if plugin.telemetry and plugin.telemetry.enabled:

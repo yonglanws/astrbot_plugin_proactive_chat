@@ -86,7 +86,7 @@ function recycleSocket(ws) {
 
 function ensureGlobalWs() {
     // AstrBot 插件页面运行在受限 iframe 中，拿不到 Dashboard 的 WebSocket 凭据；
-    // 页面改用应用层的 3 秒兜底轮询，不建立独立连接。
+    // 页面改用应用层的 10 秒兜底轮询，不建立独立连接。
     if (window.ProactiveBridge && window.ProactiveBridge.embedded) {
         return;
     }

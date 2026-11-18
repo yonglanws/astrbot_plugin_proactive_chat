@@ -153,7 +153,7 @@ effective_max = max(effective_min, base_max × scale)
 retry = max(min_skip_retry_minutes, effective_min × skip_retry_ratio)
 ```
 
-默认 `min_skip_retry_minutes=5`、`skip_retry_ratio=0.2`。
+默认 `min_skip_retry_minutes=5`、`skip_retry_ratio=20`（即 20%）。配置也兼容 `0.2` 的小数写法。
 
 例如有效最小间隔 16.5 分钟 → 重试等待 `max(5, 3.3) = 5` 分钟。高热度用户因此有更多自然触发窗口，同时不会刷屏。
 

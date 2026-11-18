@@ -10,9 +10,12 @@
 from __future__ import annotations
 
 import random
+import re
 import time
 from datetime import datetime
 from typing import Any, Mapping
+
+from ..domain.content_text import reduce_segment_text
 
 from ..domain.humanization import (
     CONVERSATION_STATE_LABELS,
@@ -47,6 +50,26 @@ def hour_bucket(hour: int) -> str:
         if start <= hour < end:
             return label
     return "unknown"
+
+
+_CLOSURE_RE = re.compile(
+    r"(晚安|先睡了?|去睡了?|早点休息|拜拜|先忙了?|回头聊|明天聊|回聊|下次聊|good\s*night|bye)",
+    re.IGNORECASE,
+)
+
+
+def _history_looks_closed(recent_history: list | None) -> bool:
+    if not recent_history:
+        return False
+    for item in list(recent_history)[-2:]:
+        if isinstance(item, dict):
+            content = item.get("content")
+        else:
+            content = getattr(item, "content", None)
+        text = reduce_segment_text(content).strip()
+        if text and len(text) <= 40 and _CLOSURE_RE.search(text):
+            return True
+    return False
 
 
 class ConversationStateService:
@@ -184,11 +207,16 @@ class ConversationStateService:
         *,
         session_config: Mapping[str, Any] | None = None,
         now: float | None = None,
+        read_only: bool = False,
     ) -> dict[str, Any]:
         """根据时间与未回复计数重新计算关系状态。"""
         timestamp = float(now if now is not None else time.time())
         settings = self.get_settings(session_config)
-        state = self.get_state(session_id, create=True)
+        state = (
+            dict(self.get_state(session_id, create=False))
+            if read_only
+            else self.get_state(session_id, create=True)
+        )
         payload = self._session_payload(session_id)
 
         if payload.get(PAUSE_FLAG):
@@ -390,6 +418,7 @@ class ConversationStateService:
         session_config: Mapping[str, Any] | None = None,
         persona_energy: float = 0.6,
         open_loop_count: int = 0,
+        recent_history: list | None = None,
         now: float | None = None,
         rng: random.Random | None = None,
         manual: bool = False,
@@ -482,6 +511,13 @@ class ConversationStateService:
             weights[Intent.CONTINUE_TOPIC] *= boost
             weights[Intent.CARE] *= boost
 
+        # 如果最近 1-2 条刚说过晚安/先忙/明天聊，不再强行延续旧话题，改走新话题或轻关心。
+        recent_closed = _history_looks_closed(recent_history)
+        if recent_closed:
+            weights[Intent.CONTINUE_TOPIC] *= 0.2
+            weights[Intent.NEW_TOPIC] *= 1.6
+            weights[Intent.SHARE_SELF] *= 1.3
+
         # 历史反馈：用 Beta 平滑后的正向率给意图加权，避免小样本极端值。
         for intent, weight in list(weights.items()):
             success = self._intent_success_rate(
@@ -572,13 +608,23 @@ class ConversationStateService:
         *,
         session_config: Mapping[str, Any] | None = None,
         now: float | None = None,
+        read_only: bool = False,
     ) -> dict[str, Any]:
         timestamp = float(now if now is not None else time.time())
+        settings = self.get_settings(session_config)
+        if not settings.enabled:
+            # 关闭关系状态机后不再把状态注入提示词（原始统计仍保留，
+            # 重新开启时可继续使用）。
+            return {"enabled": False}
         state = self.refresh(
-            session_id, session_config=session_config, now=timestamp
+            session_id,
+            session_config=session_config,
+            now=timestamp,
+            read_only=read_only,
         )
         state_value = str(state.get("state") or ConversationState.IDLE.value)
         return {
+            "enabled": True,
             "state": state_value,
             "state_label": CONVERSATION_STATE_LABELS.get(
                 ConversationState(state_value), state_value

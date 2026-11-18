@@ -23,6 +23,46 @@ class DeliveryPlanStage(BaseStage):
 
     async def handle(self, ctx) -> StageResult:
         plugin = self.orchestrator.plugin
+        extra = ctx.extra or {}
+
+        # 到这里 GUARD / CRITIC 都已通过。此时才派发 OnLLMResponseEvent：
+        # TTS 等插件常在该钩子里直接发语音，提前派发会导致文本被拦截、
+        # 语音却已经发出去。放在发送计划之前，钩子改写后的文本仍会参与分气泡。
+        llm_response = extra.get("llm_response")
+        if llm_response is not None:
+            # 守卫/Critic 可能已改写 extra["response_text"]；先同步回响应对象，
+            # 否则 TTS 插件在 OnLLMResponseEvent 里仍会朗读被拦截前的原文。
+            current_text = str(extra.get("response_text") or "")
+            if current_text:
+                try:
+                    llm_response.completion_text = current_text
+                except Exception as e:
+                    logger.debug(f"[主动消息] 同步改写后的响应文本失败喵: {e}")
+            raw_chain_before = list(
+                getattr(getattr(llm_response, "result_chain", None), "chain", []) or []
+            )
+            try:
+                stopped = await plugin.llm_service.dispatch_llm_response_hooks(
+                    ctx.event, llm_response
+                )
+            except Exception as e:
+                logger.error(f"[主动消息] 派发 LLM 后置钩子失败喵: {e}")
+                stopped = False
+            if stopped:
+                logger.info(
+                    "[主动消息] LLM 后置钩子终止了事件传播，放弃本次生成结果喵。"
+                )
+                ctx.abort("llm_response_stopped")
+                return StageResult.STOP
+            updated_text = plugin.llm_service.extract_response_text(llm_response)
+            updated_chain = plugin.llm_service.extract_response_chain(llm_response)
+            if updated_text and (not current_text or updated_text != current_text):
+                extra["response_text"] = updated_text
+            if updated_chain and (
+                not extra.get("result_chain") or updated_chain != raw_chain_before
+            ):
+                extra["result_chain"] = updated_chain
+
         session_config = plugin.config_service.get_session_config(ctx.session_id) or {}
         humanization = session_config.get("humanization_settings", {})
         raw_settings = (

@@ -184,13 +184,25 @@ def test_missing_provider_uses_fallback():
     assert "provider_missing" in result["reason"]
 
 
-def test_non_text_message_resumes():
+def test_non_text_message_stays_paused_in_llm_topic():
     plugin = FakePlugin(with_provider=False)
     should, result = asyncio.run(
         plugin.topic_judge_service.should_resume(UMO, "", config())
     )
+    assert should is False
+    assert result["reason"] == "non_text_while_paused"
+    assert result["mode"] == "llm_topic"
+
+
+def test_non_text_message_resumes_in_any_message_mode():
+    plugin = FakePlugin(with_provider=False)
+    should, result = asyncio.run(
+        plugin.topic_judge_service.should_resume(
+            UMO, "", config(resume_mode="any_message")
+        )
+    )
     assert should is True
-    assert result["reason"] == "non_text_message"
+    assert result["mode"] == "any_message"
 
 
 class TestParseDecision:

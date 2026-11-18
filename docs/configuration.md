@@ -37,6 +37,18 @@ UMO 示例：
 qq_official:FriendMessage:0A1B2C3D4E5F60718293A4B5C6D7E8F9
 ```
 
+### 2.1.1 Provider 下拉选择
+
+聊天主流程直接使用 AstrBot 为当前会话配置好的 Provider，不需要额外配置。以下“专用 Provider”字段仍是可选的，但配置页已从手填 ID 改成下拉选择（数据来自 `/api/providers`）：
+
+| 字段 | 说明 |
+| --- | --- |
+| `pause_settings.topic_judge_provider_id` | 话题判定专用 Provider；留空使用当前聊天 Provider |
+| `humanization_settings.generation_settings.planner_provider_id` | planner 专用 Provider |
+| `humanization_settings.generation_settings.critic_provider_id` | critic 专用 Provider |
+
+下拉项来自 AstrBot 已加载的 Provider；配置里已有的老 ID 会保留显示为“当前不可用”，不会在打开配置页时被静默清空。
+
 ### 2.2 `auto_trigger_settings`
 
 插件启动后，如果某个私聊长时间没有消息，可以自动排一次主动消息。
@@ -79,6 +91,8 @@ qq_official:FriendMessage:0A1B2C3D4E5F60718293A4B5C6D7E8F9
 
 平台流水读取失败时会自动回退到对话历史。
 
+> AstrBot 4.x 默认只给群聊和 webchat 私聊写 `platform_message_history`。本插件会为自己启用的私聊补写用户消息（与主动消息使用同一 `platform_id + target_id` 口径，保留 700 条），因此 QQ / aiocqhttp 私聊在 `platform_message_history` / `hybrid` 模式下也能看到双方对话。
+
 ### 2.5 `schedule_settings`
 
 | 字段 | 类型 | 默认 | 说明 |
@@ -110,7 +124,7 @@ qq_official:FriendMessage:0A1B2C3D4E5F60718293A4B5C6D7E8F9
 | `content_cleanup_rule` | string | `[\n]` | 清理正则 |
 | `interval_method` | string | `log` | `log` / `random` |
 | `interval` | string | `1.5, 3.5` | random 模式的秒数区间 |
-| `log_base` | string | `1.8` | log 模式底数 |
+| `log_base` | float | `1.8` | log 模式底数，必须大于 1 |
 
 ### 2.8 `intensity_settings`
 
@@ -144,7 +158,7 @@ qq_official:FriendMessage:0A1B2C3D4E5F60718293A4B5C6D7E8F9
 | `topic_judge_timeout_seconds` | int | `10` | 判定超时，2–60 秒 |
 | `topic_judge_context_messages` | int | `8` | 注入最近多少条对话历史；0 表示只看新消息 |
 | `fallback_resume_on_error` | bool | `true` | 判定超时/报错/无法解析时是否默认恢复 |
-| `topic_judge_provider_id` | string | `""` | 可选的专用 Provider ID；留空使用当前聊天 Provider |
+| `topic_judge_provider_id` | string（下拉选择） | `""` | 可选的专用 Provider；留空使用当前聊天 Provider |
 
 `llm_topic` 的判定标准：
 
@@ -256,8 +270,8 @@ qq_official:FriendMessage:0A1B2C3D4E5F60718293A4B5C6D7E8F9
 | `critic_enabled` | bool | `false` | 启用 critic |
 | `planner_timeout_seconds` | float | `8` | planner 超时 |
 | `critic_timeout_seconds` | float | `10` | critic 超时 |
-| `planner_provider_id` | string | `""` | planner 专用 Provider |
-| `critic_provider_id` | string | `""` | critic 专用 Provider |
+| `planner_provider_id` | string（下拉选择） | `""` | planner 专用 Provider |
+| `critic_provider_id` | string（下拉选择） | `""` | critic 专用 Provider |
 
 ---
 
@@ -270,7 +284,7 @@ qq_official:FriendMessage:0A1B2C3D4E5F60718293A4B5C6D7E8F9
 | `port` | int | `4100` | 监听端口 |
 | `password` | string | `""` | 访问密码，留空则无需登录 |
 
-生产环境建议设置强密码，并只监听内网/本机。
+生产环境建议设置强密码，并只监听内网/本机。**未设置密码时，即使 `host` 配成 `0.0.0.0`，启动时也会强制改回 `127.0.0.1`**，避免管理接口在局域网裸奔；需要局域网访问时请先设置密码。
 
 > `web_admin` 只控制**独立 WebUI**。AstrBot 原生插件页面（`views/proactive-chat`）由 Dashboard 直接加载，不受 `enabled`、端口或密码影响。如果只用 AstrBot 页面，可以把 `web_admin.enabled` 设为 `false` 以减少一个监听端口。
 
@@ -289,9 +303,24 @@ qq_official:FriendMessage:0A1B2C3D4E5F60718293A4B5C6D7E8F9
 
 | 字段 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
-| `enabled` | bool | `true` | 匿名遥测 |
+| `enabled` | bool | `false` | 匿名遥测（默认关闭） |
 
-遥测不会上传会话列表原文、提示词正文、聊天内容或管理端密码。
+遥测不会上传会话列表原文、提示词正文、聊天内容或管理端密码。发送前会递归清理配置快照：任意层级的 `*prompt*` 键整段删除，`password` / `token` / `secret` / `api_key` / `session_list` 等键删除，`session_list` 只保留数量。
+
+---
+
+## 5.1 会话级开关指令
+
+在当前私聊发送以下指令，不需要修改全局配置：
+
+| 指令 | 说明 |
+| --- | --- |
+| `/开启主动回复` | 写入当前会话 `enable=true`，解除暂停并立即排期 |
+| `/关闭主动回复` | 写入当前会话 `enable=false`，取消 job 与自动触发器 |
+| `/主动回复状态` | 查看开关、下一次触发、未回复次数、暂停/冷却状态 |
+| `/主动回复 开` / `/主动回复 关` / `/主动回复 状态` | 等价写法 |
+
+这些指令只接受私聊；写入的是 `session_overrides.json`，不会改动 `session_list`。即使会话不在全局白名单，显式 `enable=true` 的覆盖也会被视为“会话级开启”，这是指令能够独立开通某个私聊的关键。
 
 ---
 

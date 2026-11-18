@@ -63,7 +63,7 @@ class TelemetryManager:
         self._config = config
         # 版本号由统一版本工具提供，避免不同模块各自解析 metadata 造成不一致。
         self._plugin_version = plugin_version
-        # 遥测默认开启，只有用户明确在 telemetry_config 中关闭时才停用。
+        # 遥测默认关闭，只有用户明确在 telemetry_config 中开启时才启用。
         self._enabled = self._read_enabled(config)
         # 为当前安装实例生成稳定匿名 ID，用于跨重启聚合同一实例的遥测事件。
         self._instance_id = self._get_or_create_instance_id()
@@ -103,17 +103,17 @@ class TelemetryManager:
             config.get("telemetry_config") if isinstance(config, dict) else None
         )
         if not isinstance(telemetry_config, dict):
-            return True
+            return False
 
-        enabled = telemetry_config.get("enabled", True)
+        enabled = telemetry_config.get("enabled", False)
         if isinstance(enabled, bool):
             return enabled
 
         logger.warning(
             "[主动消息] 遥测启用配置类型异常"
-            f"（{type(enabled).__name__}），已按默认开启处理喵。"
+            f"（{type(enabled).__name__}），已按默认关闭处理喵。"
         )
-        return True
+        return False
 
     @property
     def enabled(self) -> bool:
@@ -265,7 +265,13 @@ class TelemetryManager:
                 logger.debug(f"[主动消息] 遥测事件发送失败喵: HTTP {response.status}")
                 return False
         except asyncio.TimeoutError:
-            logger.debug("[主动消息] 遥测请求超时喵。")
+            if requeue_on_failure:
+                self._backlog.extend(events)
+                logger.debug(
+                    f"[主动消息] 遥测请求超时喵，{len(events)} 条事件已缓冲。"
+                )
+            else:
+                logger.debug("[主动消息] 遥测请求超时喵。")
             return False
         except aiohttp.ClientConnectionError as e:
             # 连接失败触发短暂熔断（60秒），事件转入 backlog。
@@ -450,40 +456,57 @@ class TelemetryManager:
 
         return True
 
+    # 配置快照中绝不能上传的键（大小写不敏感）。
+    _SENSITIVE_CONFIG_KEY_PATTERN = re.compile(
+        r"(?i)(password|passwd|token|secret|api[_-]?key|app[_-]?key|"
+        r"cookie|authorization|session_list)"
+    )
+    # 任意层级包含 prompt 的键都视为提示词正文，整段移除。
+    _PROMPT_CONFIG_KEY_PATTERN = re.compile(r"(?i)(^prompt$|_prompt$)")
+
+    def _sanitize_config_snapshot(self, value: Any) -> Any:
+        """递归清理配置快照。
+
+        旧实现只删除第一层的 ``proactive_prompt``，导致
+        ``context_settings.platform_history_prompt``、
+        ``pause_settings.topic_judge_prompt`` 等嵌套提示词原文仍被上传。
+        这里按任意层级递归处理：
+        - 键名包含 prompt：整段删除；
+        - password/token/secret/session_list 等：删除，session_list 仅保留数量；
+        - 群聊相关旧配置：删除。
+        """
+        if isinstance(value, dict):
+            cleaned: dict[str, Any] = {}
+            for raw_key, raw_value in value.items():
+                key = str(raw_key)
+                if "group" in key.lower():
+                    continue
+                if self._PROMPT_CONFIG_KEY_PATTERN.search(key):
+                    continue
+                if self._SENSITIVE_CONFIG_KEY_PATTERN.search(key):
+                    if key == "session_list":
+                        cleaned["session_list_count"] = (
+                            len(raw_value)
+                            if isinstance(raw_value, list)
+                            else 0
+                        )
+                    continue
+                cleaned[key] = self._sanitize_config_snapshot(raw_value)
+            return cleaned
+        if isinstance(value, list):
+            return [self._sanitize_config_snapshot(item) for item in value]
+        return value
+
     async def track_config(self, config: dict[str, Any]) -> bool:
-        """上报配置快照，过滤敏感字段但保留统计型配置。"""
+        """上报配置快照，递归过滤敏感字段但保留统计型配置。"""
         if not self._enabled:
             return False
 
         try:
             # 深拷贝后再修改，避免遥测过滤逻辑意外污染插件运行中的真实配置对象。
             config_copy = copy.deepcopy(config)
-
-            # 兼容旧键：private_settings 与 friend_settings 都要脱敏。
-            for settings_key in ("private_settings", "friend_settings"):
-                settings = config_copy.get(settings_key)
-                if not isinstance(settings, dict):
-                    continue
-                # 私聊会话列表不上传原文，只保留数量用于统计默认值设计是否合理。
-                session_list = settings.pop("session_list", [])
-                settings["session_list_count"] = (
-                    len(session_list) if isinstance(session_list, list) else 0
-                )
-                # 私聊主动提示词正文属于高敏感内容，必须完全移除。
-                if "proactive_prompt" in settings:
-                    del settings["proactive_prompt"]
-
-            # 群聊配置已废弃；即使旧配置文件中仍存在，也不进入遥测。
-            for key in list(config_copy.keys()):
-                if "group" in str(key).lower():
-                    del config_copy[key]
-
-            web_admin = config_copy.get("web_admin")
-            if isinstance(web_admin, dict) and "password" in web_admin:
-                # 管理端密码绝不进入遥测事件。
-                del web_admin["password"]
-
-            return await self.track("config", config_copy)
+            sanitized = self._sanitize_config_snapshot(config_copy)
+            return await self.track("config", sanitized)
         except Exception as e:
             logger.debug(f"[主动消息] 配置快照提取失败喵: {e}")
             return False
@@ -563,15 +586,19 @@ class TelemetryManager:
             self._feature_buffer = []
 
         # 尝试最后一次性发送 backlog 中的积压事件（best-effort，失败则丢弃）。
-        if self._backlog and self._session and not self._session.closed:
-            remaining = list(self._backlog)
-            self._backlog.clear()
-            try:
-                await self._send_batch(remaining)
-            except Exception:
-                pass
-
-        if self._session and not self._session.closed:
-            await self._session.close()
-            self._session = None
-            logger.debug("[主动消息] 遥测会话已关闭喵。")
+        # 即使 _session 尚未延迟创建（例如启动后仅缓冲了少量 feature 事件），
+        # 只要遥测仍开启，也按需创建临时/延迟会话完成最后一次 flush。
+        try:
+            if self._backlog:
+                remaining = list(self._backlog)
+                self._backlog.clear()
+                if self._enabled:
+                    try:
+                        await self._send_batch(remaining, requeue_on_failure=False)
+                    except Exception:
+                        pass
+        finally:
+            if self._session and not self._session.closed:
+                await self._session.close()
+                self._session = None
+                logger.debug("[主动消息] 遥测会话已关闭喵。")

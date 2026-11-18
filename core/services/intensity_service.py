@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import copy
+import inspect
 import random
 import re
 import time
@@ -97,7 +98,9 @@ class IntensityService:
             "seed": {},
         }
 
-    def get_state(self, session_id: str, *, create: bool = False) -> dict[str, Any]:
+    def get_state(
+        self, session_id: str, *, create: bool = False, read_only: bool = False
+    ) -> dict[str, Any]:
         """读取会话强度状态；``create=True`` 时初始化缺失字段。"""
         session_data = getattr(self.plugin, "session_data", None)
         if not isinstance(session_data, dict):
@@ -105,17 +108,19 @@ class IntensityService:
 
         payload = session_data.get(session_id)
         if not isinstance(payload, dict):
-            if not create:
+            if not create or read_only:
                 return self.default_state()
             payload = {}
             session_data[session_id] = payload
 
         state = payload.get(INTENSITY_KEY)
         if not isinstance(state, dict):
-            if not create:
+            if not create or read_only:
                 return self.default_state()
             state = self.default_state()
             payload[INTENSITY_KEY] = state
+        if read_only:
+            state = copy.deepcopy(state)
 
         # 容忍旧版本或被手工编辑过的数据。
         if not isinstance(state.get("events"), list):
@@ -327,10 +332,11 @@ class IntensityService:
         *,
         now: float | None = None,
         settings: IntensitySettings | None = None,
+        read_only: bool = False,
     ) -> IntensitySignals:
         timestamp = float(now if now is not None else time.time())
         settings = settings or self.get_settings()
-        state = self.get_state(session_id)
+        state = self.get_state(session_id, read_only=read_only)
 
         events = [
             item
@@ -467,6 +473,29 @@ class IntensityService:
             proactive_count_30d=int(proactive_count_30d),
         )
 
+    @staticmethod
+    def _call_snapshot(
+        service: Any,
+        session_id: str,
+        *,
+        read_only: bool,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        fn = getattr(service, "snapshot", None)
+        if not callable(fn):
+            return {}
+        if read_only:
+            try:
+                sig = inspect.signature(fn)
+                if "read_only" in sig.parameters or any(
+                    p.kind is inspect.Parameter.VAR_KEYWORD
+                    for p in sig.parameters.values()
+                ):
+                    kwargs["read_only"] = True
+            except (TypeError, ValueError):
+                pass
+        return fn(session_id, **kwargs)
+
     def evaluate(
         self,
         session_id: str,
@@ -474,12 +503,15 @@ class IntensityService:
         *,
         now: float | None = None,
         settings: IntensitySettings | None = None,
+        read_only: bool = False,
     ) -> dict[str, Any]:
         """返回一份完整的、可 JSON 序列化的强度快照。"""
         timestamp = float(now if now is not None else time.time())
         session_config = session_config or self._get_session_config(session_id)
         settings = settings or self.get_settings(session_config)
-        signals = self.build_signals(session_id, now=timestamp, settings=settings)
+        signals = self.build_signals(
+            session_id, now=timestamp, settings=settings, read_only=read_only
+        )
         result = compute_score(signals, settings)
 
         schedule_conf = (
@@ -501,7 +533,7 @@ class IntensityService:
                 1.0,
             )
 
-        state = self.get_state(session_id)
+        state = self.get_state(session_id, create=not read_only, read_only=read_only) if not read_only else self.get_state(session_id, create=False, read_only=True)
         session_data = (
             getattr(self.plugin, "session_data", {}).get(session_id, {})
             if isinstance(getattr(self.plugin, "session_data", {}), dict)
@@ -531,8 +563,12 @@ class IntensityService:
         try:
             state_service = getattr(self.plugin, "conversation_state_service", None)
             if state_service is not None:
-                conversation_state = state_service.snapshot(
-                    session_id, session_config=session_config, now=timestamp
+                conversation_state = self._call_snapshot(
+                    state_service,
+                    session_id,
+                    read_only=read_only,
+                    session_config=session_config,
+                    now=timestamp,
                 )
         except Exception:
             conversation_state = {}
@@ -541,24 +577,36 @@ class IntensityService:
                 self.plugin, "conversation_memory_service", None
             )
             if memory_service is not None:
-                conversation_memory = memory_service.snapshot(
-                    session_id, session_config=session_config, now=timestamp
+                conversation_memory = self._call_snapshot(
+                    memory_service,
+                    session_id,
+                    read_only=read_only,
+                    session_config=session_config,
+                    now=timestamp,
                 )
         except Exception:
             conversation_memory = {}
         try:
             rhythm_service = getattr(self.plugin, "rhythm_service", None)
             if rhythm_service is not None:
-                rhythm_state = rhythm_service.snapshot(
-                    session_id, now=timestamp, session_config=session_config
+                rhythm_state = self._call_snapshot(
+                    rhythm_service,
+                    session_id,
+                    read_only=read_only,
+                    now=timestamp,
+                    session_config=session_config,
                 )
         except Exception:
             rhythm_state = {}
         try:
             persona_service = getattr(self.plugin, "persona_state_service", None)
             if persona_service is not None:
-                persona_state = persona_service.snapshot(
-                    session_id, session_config=session_config, now=timestamp
+                persona_state = self._call_snapshot(
+                    persona_service,
+                    session_id,
+                    read_only=read_only,
+                    session_config=session_config,
+                    now=timestamp,
                 )
         except Exception:
             persona_state = {}
@@ -836,6 +884,7 @@ class IntensityService:
         session_ids: list[str] | None = None,
         *,
         now: float | None = None,
+        read_only: bool = False,
     ) -> list[dict[str, Any]]:
         """批量生成快照，按分数从高到低排序。"""
         plugin = self.plugin
@@ -845,7 +894,9 @@ class IntensityService:
         results: list[dict[str, Any]] = []
         for session_id in session_ids:
             try:
-                snapshot = self.evaluate(session_id, now=now)
+                snapshot = self.evaluate(
+                    session_id, now=now, read_only=read_only
+                )
             except Exception as e:  # 单个会话异常不应拖垮整个面板
                 logger.debug(f"[主动消息] 计算互动强度失败喵: {session_id} {e}")
                 continue
@@ -900,9 +951,14 @@ class IntensityService:
         except (TypeError, ValueError):
             return default
 
-    def summary(self, session_ids: list[str] | None = None) -> dict[str, Any]:
+    def summary(
+        self,
+        session_ids: list[str] | None = None,
+        *,
+        read_only: bool = False,
+    ) -> dict[str, Any]:
         """管理端顶部指标：平均分、各等级人数、平均概率。"""
-        snapshots = self.collect_snapshots(session_ids)
+        snapshots = self.collect_snapshots(session_ids, read_only=read_only)
         active = [item for item in snapshots if item.get("has_state")]
         tiers: dict[str, int] = {}
         for item in snapshots:

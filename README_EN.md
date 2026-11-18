@@ -24,13 +24,13 @@
   - **effective interval** (default base 30–600 min × 0.35–1.15, with an 8-minute floor).
 - Chooses **continue topic / new topic / care / share self / ask / stay silent** before generating text.
 - Classifies replies as substantive / question / perfunctory / negative / media; negative feedback pauses proactive messages, and perfunctory/negative replies do **not** count as a reply to the previous proactive message.
-- Runs a **pre-send naturalness guard** for repetition, length, too many questions, AI self-reference and customer-service tone.
-- Sends 1–3 message bubbles with contextual delays, and only tries voice with a configured probability.
-- Maintains a short-term **topic ledger** (open loops, user plans/events, unanswered questions) and a lightweight expression profile.
+- Runs a **context-first intent & naturalness guard** (`CONTEXT → INTENT → PLAN → WRITE → REVIEW → CRITIC → GUARD`) checking repetition, repetitive openers, length, true consecutive questions, AI self-reference and customer-service tone, using natural persona-first prompts with relative turn timestamps.
+- Sends 1–3 message bubbles with typing-paced contextual delays and casual short-bubble punctuation, skips random voice on links/code/pure-emoji/overlong texts, and archives only the actually delivered text (`DeliveryReport`).
+- Maintains a short-term **topic ledger** (open loops with due-time expiration, user plans/events, unanswered questions) and a lightweight expression profile.
 - Optionally uses **planner / writer / critic** multi-stage generation.
 - Ships an **offline replay** tool to evaluate the policy against a real AstrBot database without sending messages.
 - Supports quiet hours, daily budget, minimum gap, TTS and segmented replies.
-- **Auto-pauses a user after several consecutive unanswered proactive messages**; on the next message an LLM topic check decides whether to resume (new topic) or stay paused (same topic). `resume_mode=any_message` is also available.
+- **Auto-pauses immediately after `max_unanswered_times` (default 4) consecutive unanswered proactive messages** without scheduling an extra round; on the next message under `llm_topic` mode, an LLM topic check decides whether to resume (new topic) or stay paused (same topic or non-text/media-only). `resume_mode=any_message` is also available.
 - Optionally recalls from and writes back to **LivingMemory**.
 - Ships a standalone WebUI with a dedicated **Intensity** page and humanization badges.
 
@@ -45,7 +45,9 @@
    qq_official:FriendMessage:<user_openid>
    ```
 
-3. Configure:
+3. Make sure the bot-level `plugin_set` includes `astrbot_plugin_proactive_chat` (AstrBot filters private-message listeners by this whitelist; `OnAstrBotLoadedEvent` still runs when it is missing, so the plugin can look "running" while never seeing replies).
+
+4. Configure:
 
    ```yaml
    private_settings:
@@ -61,9 +63,22 @@
        enable: true
    ```
 
-4. Open the WebUI at `http://127.0.0.1:4100` and check **Status / Intensity / Tasks**.
+5. Open the WebUI at `http://127.0.0.1:4100` and check **Status / Intensity / Tasks**.
 
-Full Chinese documentation: [README.md](README.md), [docs/](docs/).
+The plugin page and standalone WebUI now ship all frontend libraries under `views/proactive-chat/lib/`; no external CDN is required. Telemetry is disabled by default, and prompt/password/token fields are recursively stripped even when enabled.
+
+Per-session controls (private chats only, no global config edit needed):
+
+```text
+/开启主动回复      enable proactive messages for this chat
+/关闭主动回复      disable them for this chat
+/主动回复状态      show status
+/主动回复 开|关|状态
+```
+
+The switch is stored in `session_overrides.json`; it works even when the UMO is not in `session_list`.
+
+Full Chinese documentation: [README.md](README.md), [docs/](docs/). The Mermaid architecture diagram is in [docs/architecture.md](docs/architecture.md).
 
 ---
 
@@ -116,7 +131,7 @@ The database is opened read-only; only private conversations are imported; `sess
 ## Tests
 
 ```bash
-python -m pytest tests -q          # 180 tests
+python -m pytest tests -q          # 213 tests
 python -m compileall -q core main.py utils tools tests
 python tools/simulate_intensity.py --all
 cd tools && npm install && node check_jsx.js

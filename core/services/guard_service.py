@@ -35,9 +35,51 @@ _BUILTIN_BLOCKED_RE = re.compile(
 )
 _AI_TONE_RE = re.compile(
     r"(希望(你|您)能理解|如果(你|您)愿意的话|有什么我可以帮|"
-    r"随时告诉我|非常抱歉|很高兴为你服务)",
+    r"随时告诉我|非常抱歉|很高兴为你服务|"
+    r"如果有需要|祝你一切顺利|期待你的回复|希望这能帮到你)",
     re.IGNORECASE,
 )
+
+_CANNED_OPENER_GROUPS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "busy_check",
+        re.compile(r"^[\s哈哈嗯嘿嗨呀啊哦~～]*(在忙吗|忙完没|忙完了吗|在干嘛|干嘛呢|在做什么)"),
+    ),
+    (
+        "meal_check",
+        re.compile(r"^[\s哈哈嗯嘿嗨呀啊哦~～]*(吃了吗|吃饭了吗|吃过饭了吗|吃晚饭了吗|吃午饭了吗|早饭吃了)"),
+    ),
+    (
+        "sleep_check",
+        re.compile(r"^[\s哈哈嗯嘿嗨呀啊哦~～]*(睡了吗|睡了没|还没睡吗|准备睡了吗)"),
+    ),
+    (
+        "generic_greeting",
+        re.compile(r"^[\s哈哈嗯嘿嗨呀啊哦~～]*(最近怎么样|最近过得怎么样|过得还好吗|好久不见)"),
+    ),
+)
+
+
+def _detect_canned_opener(text: str) -> str | None:
+    content = str(text or "").strip()
+    if not content:
+        return None
+    for name, pattern in _CANNED_OPENER_GROUPS:
+        if pattern.search(content):
+            return name
+    return None
+
+
+def _trim_at_boundary(text: str, max_chars: int) -> str:
+    content = str(text or "").strip()
+    if len(content) <= max_chars:
+        return content
+    window = content[:max_chars]
+    for sep in ("。", "！", "？", "!", "?", "\n", "～", "~", "，", ","):
+        idx = window.rfind(sep)
+        if idx >= max_chars // 2:
+            return window[: idx + 1].rstrip("，,")
+    return window
 
 _REWRITE_SYSTEM = (
     "你是一个中文私聊消息润色器。你只输出改写后的一条消息，"
@@ -105,6 +147,17 @@ class GuardService:
         keep = max(1, min(MAX_RECENT_TEXTS, settings.recent_message_count + 4))
         payload[LAST_PROACTIVE_TEXTS_KEY] = values[-keep:]
 
+    def _user_replied_since_last_proactive(self, session_id: str) -> bool:
+        payload = getattr(self.plugin, "session_data", {}).get(session_id, {})
+        if not isinstance(payload, dict):
+            return False
+        conv_state = payload.get("conversation_state")
+        if not isinstance(conv_state, dict):
+            return False
+        last_user = float(conv_state.get("last_user_at", 0) or 0)
+        last_proactive = float(conv_state.get("last_proactive_at", 0) or 0)
+        return last_user > 0 and last_proactive > 0 and last_user > last_proactive
+
     # ------------------------------------------------------------------
     # 规则检查
     # ------------------------------------------------------------------
@@ -131,9 +184,26 @@ class GuardService:
                 reasons.append("repeated")
                 break
 
-        if has_question(content):
-            question_count = sum(1 for item in recent if has_question(item))
-            if question_count >= settings.max_consecutive_questions:
+        opener = _detect_canned_opener(content)
+        if opener is not None:
+            recent_openers = [
+                _detect_canned_opener(item) for item in recent[-3:]
+            ]
+            if opener in recent_openers or sum(
+                1 for item in recent_openers if item is not None
+            ) >= 2:
+                reasons.append("repetitive_opener")
+
+        if has_question(content) and not self._user_replied_since_last_proactive(
+            session_id
+        ):
+            consecutive_questions = 0
+            for item in reversed(recent):
+                if has_question(item):
+                    consecutive_questions += 1
+                else:
+                    break
+            if consecutive_questions >= settings.max_consecutive_questions:
                 reasons.append("too_many_questions")
 
         blocked_patterns = str(settings.blocked_patterns or "").strip()
@@ -256,6 +326,7 @@ class GuardService:
         recent_block = "\n".join(f"- {item[:200]}" for item in recent) or "（无）"
         reason_labels = {
             "repeated": "和最近说过的话太像",
+            "repetitive_opener": "又用了“在干嘛/吃了吗/睡了吗”这类套路开场白",
             "too_long": "太长了，不像日常私聊",
             "too_many_questions": "连续提问太多，像在查户口",
             "ai_self_reference_or_neediness": "有 AI 自指或索取情绪价值的味道",
@@ -290,7 +361,7 @@ class GuardService:
         # 去掉模型可能附带的引号/前缀。
         rewritten = re.sub(r"^(改写|润色|回复)[:：]\s*", "", rewritten)
         rewritten = rewritten.strip().strip('"“”')
-        return rewritten[: settings.max_message_chars]
+        return _trim_at_boundary(rewritten, settings.max_message_chars)
 
     @staticmethod
     def build_default_plan_settings(session_config: Mapping[str, Any] | None):

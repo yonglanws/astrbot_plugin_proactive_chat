@@ -36,6 +36,7 @@ from .core.services.persona_state_service import PersonaStateService
 from .core.services.rhythm_service import RhythmService
 from .core.services.scheduler_service import SchedulerService
 from .core.services.sender_service import SenderService
+from .core.services.session_control_service import SessionControlService
 from .core.services.session_service import SessionService
 from .core.services.storage_service import StorageService
 from .core.services.topic_judge import TopicJudgeService
@@ -64,6 +65,9 @@ class ProactiveChatPlugin(star.Star):
         self.session_data: dict = {}
         # 记录当前正在执行“立即触发”的会话，防止重复点击导致并发主动消息。
         self.manual_trigger_sessions: set[str] = set()
+        # 所有触发来源共享的执行占用集合：定时任务与手动触发互斥，
+        # 避免同一会话并发跑两条主动消息流水线。
+        self.active_trigger_sessions: set[str] = set()
 
         self.version = get_plugin_version()
 
@@ -97,6 +101,8 @@ class ProactiveChatPlugin(star.Star):
 
         # 会话差异配置管理器
         self.session_override_manager = OverrideStore(self.data_dir)
+        # 聊天指令：为当前私聊开启/关闭主动回复（写入会话覆盖，不改全局配置）。
+        self.session_control_service = SessionControlService(self)
 
         # 通知中心与 Web 控制台
         self.notification_center = NotificationCenter(self)
@@ -119,6 +125,8 @@ class ProactiveChatPlugin(star.Star):
         self._original_exception_handler = None
         self._exception_handler_installed = False
         self._terminating = False
+        # plugin_set 漏选时由 LifecycleService 写入的页面告警文案。
+        self.plugin_set_warning: str = ""
 
         # 平台就绪后的启动流程状态（延迟初始化，先占位）
         self._startup_finalized: bool = False
@@ -272,6 +280,35 @@ class ProactiveChatPlugin(star.Star):
         也不会在群聊里读取或写入任何状态。
         """
         await self.event_handlers.on_friend_message(event)
+
+    # ------------------------------------------------------------------
+    # 会话级开关指令
+    # ------------------------------------------------------------------
+    @filter.command("主动回复", alias={"proactive"})
+    async def cmd_proactive(self, event: AstrMessageEvent, action: str = ""):
+        """为当前私聊开启/关闭主动回复，或查看状态。"""
+        yield event.plain_result(
+            await self.session_control_service.handle(event, action)
+        )
+
+    @filter.command(
+        "开启主动回复", alias={"主动回复开启", "proactive_on", "开启主动消息"}
+    )
+    async def cmd_enable_proactive(self, event: AstrMessageEvent):
+        """为当前私聊开启主动回复。"""
+        yield event.plain_result(await self.session_control_service.enable(event))
+
+    @filter.command(
+        "关闭主动回复", alias={"主动回复关闭", "proactive_off", "关闭主动消息"}
+    )
+    async def cmd_disable_proactive(self, event: AstrMessageEvent):
+        """为当前私聊关闭主动回复。"""
+        yield event.plain_result(await self.session_control_service.disable(event))
+
+    @filter.command("主动回复状态", alias={"proactive_status"})
+    async def cmd_proactive_status(self, event: AstrMessageEvent):
+        """查看当前私聊的主动回复状态。"""
+        yield event.plain_result(await self.session_control_service.status(event))
 
     # ==================================================================
     # 主动消息主流程

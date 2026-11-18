@@ -317,8 +317,19 @@ class WebConsoleServer:
             logger.info("[主动消息] Web 管理端未启用喵。")
             return
 
-        host = web_admin.get("host", "127.0.0.1")
+        host = str(web_admin.get("host", "127.0.0.1") or "127.0.0.1").strip()
         configured_port = int(web_admin.get("port", 4100))
+
+        # 未设置密码时禁止监听非回环地址，避免 /api/config、/api/jobs/*/trigger
+        # 等管理接口在局域网/公网裸奔。仍然允许用户设置密码后显式监听 0.0.0.0。
+        password = str(web_admin.get("password") or "").strip()
+        loopback_hosts = {"127.0.0.1", "localhost", "::1"}
+        if not password and host not in loopback_hosts:
+            logger.warning(
+                "[主动消息] Web 管理端未设置密码，已强制改为仅监听 127.0.0.1 喵。"
+                "如需局域网访问，请先在配置中设置访问密码。"
+            )
+            host = "127.0.0.1"
 
         in_docker = is_running_in_docker()
         port = self._resolve_bind_port(

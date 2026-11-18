@@ -161,12 +161,11 @@ class TopicJudgeService:
                 "fallback": False,
             }
 
-        # 图片/语音等非文本消息无法可靠判断话题，按“重新互动”处理，
-        # 避免用户发图后仍被永久暂停。
+        # 暂停状态下仅收到表情包/图片等非文本消息不自动解除暂停，避免误清零未回复计数。
         if not text:
-            return True, {
-                "new_topic": True,
-                "reason": "non_text_message",
+            return False, {
+                "new_topic": False,
+                "reason": "non_text_while_paused",
                 "mode": "llm_topic",
                 "fallback": False,
             }

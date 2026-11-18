@@ -143,7 +143,9 @@ function App() {
 
         const schedule = () => {
             if (disposed) return;
-            const interval = wsConnectedRef.current ? 30000 : 3000;
+            // 内嵌页面没有 WebSocket，兜底轮询从 3 秒放宽到 10 秒，
+            // 避免频繁触发会批量计算全部会话的 /api/status。
+            const interval = wsConnectedRef.current ? 30000 : 10000;
             timer = window.setTimeout(async () => {
                 if (disposed) return;
                 // 页面隐藏时跳过本轮请求，减少后台标签页的无意义流量。

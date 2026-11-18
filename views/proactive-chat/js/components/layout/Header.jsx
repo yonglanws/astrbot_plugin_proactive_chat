@@ -28,8 +28,8 @@ function RealTimeClock({ timeZone }) {
 function Header({ currentView, wsConnected }) {
     const { state, dispatch } = useAppContext();
     const { config, status } = state;
-    // 若配置中未单独指定展示时区，则默认按插件主要使用场景的东八区展示。
-    const displayTimezone = config?.displayTimezone || 'Asia/Shanghai';
+    // 展示时区由后端按 AstrBot 调度时区返回；旧后端缺省时回退浏览器时区。
+    const displayTimezone = window.resolveDisplayTimezone(config);
 
     const toggleTheme = () => {
         dispatch({ type: 'TOGGLE_THEME' });

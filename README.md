@@ -1,4 +1,4 @@
-# 私聊主动消
+# 私聊主动消息
 
 > 基于 [Pancakes-Labs/astrbot_plugin_proactive_chat](https://github.com/Pancakes-Labs/astrbot_plugin_proactive_chat) 的二改版本。
 >
@@ -264,7 +264,7 @@ private_settings:
 - 「互动强度」能看到该用户的分数、概率与有效间隔；
 - 「任务管理」能看到下一次主动消息任务。
 
-也可以点击任务卡片的「立即触发」做一次手动测试（手动触发会跳过概率判定）。
+也可以点击任务卡片的「立即触发」做一次手动测试（手动触发会跳过概率判定与免打扰时段；手动触发与定时任务互斥，同一会话不会并发发送）。
 
 ---
 
@@ -289,15 +289,28 @@ private_settings:
 | 文档浏览 | 直接查看本仓库的 README 与 docs |
 | 配置管理 | 全局配置 + 单会话差异配置（只展示私聊字段，含 `humanization_settings`） |
 
-两种入口共用 `views/proactive-chat/` 下的同一份前端源码：内嵌模式通过 AstrBot bridge 调 API、用 3 秒轮询刷新；独立模式走 HTTP + WebSocket 和登录 token。
+两种入口共用 `views/proactive-chat/` 下的同一份前端源码：内嵌模式通过 AstrBot bridge 调 API、用 10 秒轮询刷新；独立模式走 HTTP + WebSocket 和登录 token。
 
-> 前端通过 CDN 加载 React / MUI / Babel。国内网络会自动走 npmmirror，海外走 unpkg。
+> React / ReactDOM / MUI / Emotion / marked / DOMPurify / mermaid 已全部放在 `views/proactive-chat/lib/` 随插件本地分发，离线、内网或 CDN 不可达时页面仍可加载。源码仓库额外用本地 Babel Standalone 编译 JSX；Release 包会预编译 JSX 并移除 Babel 依赖。
 
 ---
 
 ## 配置说明（摘要）
 
 完整字段见 [docs/configuration.md](docs/configuration.md)。
+
+### 会话级开关指令
+
+不需要改配置文件，直接在当前私聊发送：
+
+| 指令 | 作用 |
+| --- | --- |
+| `/开启主动回复` | 开启当前私聊的主动回复，并立即安排下一次 |
+| `/关闭主动回复` | 关闭当前私聊的主动回复，取消已有排期 |
+| `/主动回复状态` | 查看开关、下一次触发与未回复次数 |
+| `/主动回复 开` / `/主动回复 关` / `/主动回复 状态` | 同上 |
+
+开关写入 `session_overrides.json` 的会话级 `enable`，优先级高于全局 `session_list`。因此即使 UMO 不在 `session_list`，也可以用 `/开启主动回复` 单独开启某个私聊；`/关闭主动回复` 也可以单独关闭白名单里的某个会话。
 
 ### `private_settings`
 
@@ -397,8 +410,11 @@ python tools/import_astrbot_history.py \
 ## 测试与验证
 
 ```bash
-# 单元测试（180 项）
+# 全部单元 / 集成测试
 python -m pytest tests -q
+
+# 真实 AstrBot 集成测试（AstrBot 4.29.4 源码；也可设置 ASTRBOT_SRC）
+python -m pytest tests/test_real_astrbot_integration.py -q
 
 # Python 语法检查
 python -m compileall -q core main.py utils tools tests
@@ -408,6 +424,9 @@ python tools/simulate_intensity.py --all
 
 # 前端 JSX 语法检查（需要 Node + @babel/parser）
 node tools/check_jsx.js
+
+# iframe bridge 协议测试（需要 Node）
+node tests/integration/bridge_protocol_test.js
 ```
 
 测试覆盖：
@@ -429,7 +448,11 @@ node tools/check_jsx.js
 - 完整流水线集成（GATE → INTENT → CONTEXT → PLAN → DELIBERATE → REVIEW → GUARD → CRITIC → DELIVERY_PLAN → DELIVER → RECORD）；
 - 群聊 UMO 在配置、任务、事件层的全链路拒绝；
 - 调度器强度修正与强制重试；
-- 数据库导入、状态构建与种子写入。
+- 数据库导入、状态构建与种子写入；
+- 真实导入 `main.py` + AstrBot `StarHandlerRegistry`，验证 `plugin_set` 过滤与 `OnAstrBotLoadedEvent` 豁免；
+- 真实 `Context.register_web_api` / `PluginRequest` 页面路由注册与调用；
+- 真实 `bridge.js` 的 22 条 iframe bridge 路径映射；
+- 同一会话定时/手动触发并发互斥、发送窗口内用户回复中止气泡、收尾阶段竞态。
 
 ---
 
@@ -447,16 +470,16 @@ node tools/check_jsx.js
 定时触发
   └─ GATE：私聊？启用？免打扰？未回复上限？每日预算？最小间隔？
   └─ GATE：按强度、昼夜与精力掷骰（手动触发跳过）
-  └─ INTENT：延续 / 新话题 / 关心 / 分享 / 提问 / 暂不发言
-  └─ CONTEXT：人格 + 对话历史 / 平台流水 + 长期记忆召回 + 话题账本
-  └─ PLAN（可选）：planner 生成话题/目标/语气/避免事项
-  └─ DELIBERATE：writer 注入关系状态、意图、精力、时间、预算与计划，调用 LLM
+  └─ CONTEXT：人格 + 对话历史 / 平台流水（含相对时间） + 长期记忆召回 + 话题账本
+  └─ INTENT：结合最新语境选择 延续 / 新话题 / 关心 / 分享 / 提问 / 暂不发言
+  └─ PLAN（可选）：planner 结合人格摘要生成话题/目标/语气/避免事项
+  └─ DELIBERATE：writer 注入自然态引导、意图、精力、时间与计划，调用 LLM
   └─ REVIEW：生成期间用户是否又发消息？
-  └─ GUARD：重复 / 过长 / 连续提问 / AI 腔检查，必要时改写
   └─ CRITIC（可选）：语义级审稿，不通过则改写或放弃
-  └─ DELIVERY_PLAN：1–3 条气泡与延迟，概率性语音
-  └─ DELIVER：装饰 / 发送
-  └─ RECORD：存档、未回复 +1、写回长期记忆、更新话题账本/状态、按强度与作息排下一次
+  └─ GUARD：重复 / 套路开场 / 过长 / 连续提问 / AI 腔检查，必要时改写（含对改写结果的复检）
+  └─ DELIVERY_PLAN：1–3 条气泡、口语化句尾与按打字节奏的延迟，过滤不适合语音的文本后概率发语音
+  └─ DELIVER：装饰 / 发送，按实际送达气泡生成 DeliveryReport
+  └─ RECORD：仅对实际送达内容存档、未回复 +1（若达上限立即暂停并清除排期）、写回长期记忆、更新状态、按强度与作息排下一次
 ```
 
 群聊消息不会进入上述任何一步。
@@ -470,16 +493,16 @@ node tools/check_jsx.js
 规则：
 
 1. 每成功送达一次主动消息，未回复计数 +1；
-2. 达到 `schedule_settings.max_unanswered_times`（默认 4）后：
+2. 达到 `schedule_settings.max_unanswered_times`（默认 4）后**立即**：
    - 写入 `proactive_paused` 暂停标记；
    - 清除下一次触发时间与调度字段；
    - 取消当前任务和自动触发计时器；
-   - **不再继续排期**，不会每隔一段时间反复“到点即停”；
-3. 暂停后不会自动发送任何主动消息；
+   - **不再继续排期**，不会再多发一轮或每隔一段时间反复“到点即停”；
+3. 暂停后不会自动发送任何主动消息（重启恢复、自动触发及管理端重新调度也会拦截）；
 4. 对方**再次发来消息**时，按 `pause_settings.resume_mode` 决定是否恢复：
    - `llm_topic`（默认）：先用一次轻量 LLM 判断这条消息是否是新话题；
      - 新话题、问候、分享新事件、明确想继续聊 → 恢复；
-     - 继续旧话题、抱怨 Bot 不回、无意义单字/表情 → **保持暂停**；
+     - 继续旧话题、抱怨 Bot 不回、无意义单字，或纯图片/表情包等非文本消息 → **保持暂停**；
    - `any_message`：任何用户消息都立即恢复；
 5. 恢复时清除暂停标记、未回复计数归零，并按互动强度重新安排下一次主动消息；
 6. 也可以在 WebUI「运行状态 → 未回复暂停」中手动「恢复并重新排期」。
@@ -508,19 +531,125 @@ LLM 判定失败/超时默认会恢复（`pause_settings.fallback_resume_on_erro
 ## 常见问题
 
 **Q：为什么加了好友却一直不主动说话？**
-A：确认 UMO 已加入 `session_list`、`private_settings.enable=true`，并且当前不在免打扰时段；再看「互动强度」页的概率和「任务管理」里的下一次时间。
+A：先确认当前 bot 的配置里 `plugin_set` 包含 `astrbot_plugin_proactive_chat`（或在 AstrBot bot 配置页勾选本插件）。AstrBot 会按 bot 级插件集过滤私聊消息监听器；漏选时插件仍能启动和发主动消息，但用户的回复不会被记录。随后确认 UMO 已加入 `session_list`、`private_settings.enable=true`，并且当前不在免打扰时段；再看「互动强度」页的概率和「任务管理」里的下一次时间。
 
 **Q：为什么强度一直是 0？**
 A：强度只统计启用后的私聊消息。让对方发几条消息，或用导入工具预热历史。
 
 **Q：为什么概率 90% 还是没有立刻发？**
-A：概率判定只在定时任务触发时执行，且要同时通过免打扰、未回复上限等 GATE 条件。手动触发可以跳过概率。
+A：概率判定只在定时任务触发时执行，且要同时通过免打扰、未回复上限等 GATE 条件。手动触发会跳过概率判定与免打扰时段，但仍受会话禁用、未回复暂停和并发执行限制。
 
 **Q：会不会在群里发消息？**
 A：不会。本版本没有注册任何群聊监听器，配置、调度、事件构造、前端都只接受私聊 UMO。
 
+**Q：自然度守卫拦截了文本，为什么还收到 TTS？**
+A：这通常是因为其他 TTS 插件在 `on_llm_response` 钩子里直接发送语音。本版本已把 `OnLLMResponseEvent` 推迟到自然度守卫通过之后派发；守卫拦截时不会再触发 TTS。若你使用的 TTS 插件挂在 `on_decorating_result`，它也只会在文本真正发送前执行。
+
+**Q：平台流水里为什么看不到用户消息？**
+A：AstrBot 4.x 默认只给群聊和 webchat 私聊写平台流水。本插件会为启用的私聊补写用户消息；升级后让用户再发一条消息即可看到。主动消息本身也会以 Bot 身份写入同一条流水。
+
+**Q：遥测默认开启吗？会上传提示词吗？**
+A：默认关闭。即使用户主动开启，发送前也会递归删除任意层级的提示词、密码、Token、密钥与会话列表原文，只保留脱敏后的统计配置。
+
 **Q：QQ 官方机器人私聊 UMO 是什么样？**
 A：`qq_official:FriendMessage:<用户 openid>`。平台 ID 以你 AstrBot 里实际配置的机器人名为准；数据库里也可能显示为 `qq_offficial`（历史拼写），以日志/`/sid` 输出为准。
+
+---
+
+## 架构图
+
+下图是当前版本的完整运行架构，覆盖接入、事件处理、会话级开关、调度、主动消息流水线与数据层。Mermaid 源码可直接在 GitHub、VS Code、Typora 等渲染器中查看。
+
+```mermaid
+flowchart TB
+    subgraph ACCESS["① 接入层 · AstrBot"]
+        USER(["用户私聊消息"])
+        CMD["聊天指令<br/>/开启主动回复 · /关闭主动回复 · /主动回复状态"]
+        CONSOLE["AstrBot 插件页 / 独立 WebUI"]
+        LOADED["on_astrbot_loaded"]
+    end
+
+    subgraph EVENTS["② 事件处理 · EventHandlers"]
+        ENTRY["on_friend_message<br/>priority 999 · 仅私聊"]
+        FILTER["过滤 Bot 自消息与命令消息"]
+        PROFILE["更新互动强度 / 回复质量<br/>话题账本 / 作息 / 心情精力<br/>负反馈冷却 / 暂停恢复"]
+        REARM["取消旧自动触发器<br/>按强度重新安排"]
+        PLATHIST["补写平台用户流水<br/>QQ / aiocqhttp 私聊"]
+    end
+
+    subgraph CONTROL["③ 会话级开关 · SessionControlService"]
+        OVERRIDE[("session_overrides.json<br/>enable = true / false")]
+        ENABLE["开启：解除暂停 / 清零计数 / 立即排期"]
+        DISABLE["关闭：取消 job 与自动触发器 / 清除排期"]
+    end
+
+    subgraph SCHED["④ 触发与调度 · SchedulerService"]
+        APS["APScheduler<br/>next_trigger_time 持久化"]
+        AUTO["用户消息后的自动触发"]
+        MANUAL["WebUI 立即触发"]
+        RESTORE["启动 / 重载补排期<br/>缺失或过期任务"]
+        LOCK{"active_trigger_sessions<br/>同会话串行互斥"}
+    end
+
+    subgraph PIPE["⑤ 主动消息流水线 · FlowOrchestrator"]
+        GATE["GATE 准入<br/>私聊 / 启用 / 免打扰 / 未回复上限<br/>暂停 / 负反馈冷却 / 作息与每日预算<br/>强度 × 昼夜 × 精力 掷骰"]
+        CONTEXT["CONTEXT 上下文<br/>人格 + 对话历史 / 平台流水 / hybrid<br/>长期记忆召回 + 话题账本"]
+        INTENT["INTENT 意图<br/>延续 / 新话题 / 关心 / 分享 / 暂不发言"]
+        PLAN["PLAN 可选计划<br/>planner 生成话题 / 目标 / 语气"]
+        WRITE["DELIBERATE 生成<br/>AstrBot 当前会话 Provider"]
+        REVIEW["REVIEW 复核<br/>生成期间出现用户新消息 → 丢弃本轮"]
+        CRITIC["CRITIC 可选审稿<br/>语义复核 → 改写 / 放弃"]
+        GUARD["GUARD 自然度守卫<br/>重复 / 开场模板 / 长度 / 连续提问 / AI 腔<br/>拦截时不派发 LLM 后置钩子"]
+        DPLAN["DELIVERY_PLAN 气泡计划<br/>派发 OnLLMResponseEvent<br/>1–3 条气泡 / 打字延迟 / 条件语音"]
+        DELIVER["DELIVER 发送<br/>首条延迟 → TTS → 装饰 → 分段<br/>每步检查新消息 / 会话已关闭<br/>产出 DeliveryReport 仅成功派发 OnAfterMessageSent"]
+        RECORD["RECORD 记录<br/>仅对实际送达文本存档<br/>未回复 +1 / 达上限立即暂停<br/>锁内安排下一次"]
+    end
+
+    subgraph DATA["⑥ 能力、数据与安全"]
+        PROVIDER["AstrBot Provider<br/>planner / critic / topic judge 可选"]
+        LIVING["LivingMemory<br/>只读召回 / 主动消息写回"]
+        SQLITE[("data_v4.db<br/>只读预热")]
+        SEED[("intensity_seed.json<br/>启动时合并")]
+        SESSION[("session_data.json<br/>原子写入")]
+        TELEMETRY["遥测<br/>默认关闭 / 递归脱敏"]
+    end
+
+    USER --> ENTRY --> FILTER --> PROFILE
+    FILTER --> PLATHIST
+    PROFILE --> REARM --> AUTO
+    CMD --> OVERRIDE
+    CONSOLE --> OVERRIDE
+    CONSOLE --> MANUAL
+    OVERRIDE --> ENABLE
+    OVERRIDE --> DISABLE
+    ENABLE --> APS
+    DISABLE -.->|取消任务| APS
+    LOADED --> RESTORE --> APS
+    APS --> LOCK
+    AUTO --> LOCK
+    MANUAL --> LOCK
+    LOCK -->|取得执行权| GATE
+    LOCK -->|已有任务在跑| DROP["跳过本次触发"]
+    GATE -->|通过| CONTEXT --> INTENT --> PLAN --> WRITE --> REVIEW --> CRITIC --> GUARD --> DPLAN --> DELIVER --> RECORD
+    GATE -.->|免打扰 / 冷却 / 作息| APS
+    GATE -->|未回复上限| PAUSE["暂停会话<br/>等待用户新话题"]
+    PAUSE -.->|用户再次发消息| PROFILE
+    REVIEW -->|用户已回复| DROP
+    DELIVER -->|用户新消息 / 会话关闭| DROP
+    RECORD --> APS
+    PROVIDER -.-> PLAN
+    PROVIDER -.-> WRITE
+    PROVIDER -.-> CRITIC
+    LIVING -.-> CONTEXT
+    LIVING -.-> RECORD
+    SQLITE -.-> SEED -.-> SESSION
+    SESSION -.-> GATE
+    SESSION -.-> RECORD
+    OVERRIDE -.-> GATE
+    TELEMETRY -.-> SESSION
+```
+
+更完整的阶段职责、并发与持久化不变量见 [docs/architecture.md](docs/architecture.md)。
 
 ---
 

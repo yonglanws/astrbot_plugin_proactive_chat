@@ -13,6 +13,7 @@ from __future__ import annotations
 import time
 from typing import Any, Mapping
 
+from ..domain.content_text import reduce_segment_text
 from ..domain.conversation_memory import (
     close_answered_questions,
     extract_loop_candidates,
@@ -251,8 +252,12 @@ class ConversationMemoryService:
             else:
                 role = str(getattr(item, "role", "") or "")
                 content = getattr(item, "content", None)
-            text = str(content or "").strip()
-            if not text or role not in {"user", "assistant"}:
+            text = reduce_segment_text(content).strip()
+            if (
+                not text
+                or role not in {"user", "assistant"}
+                or text.startswith(("[系统任务", "[系统", "系统任务：", "[主动消息]"))
+            ):
                 continue
             at = timestamp - (len(messages) - index) * 120.0
             if role == "assistant":
@@ -283,12 +288,13 @@ class ConversationMemoryService:
         *,
         session_config: Mapping[str, Any] | None = None,
         now: float | None = None,
+        read_only: bool = False,
     ) -> dict[str, Any]:
         timestamp = float(now if now is not None else time.time())
         settings = self.get_settings(session_config)
         state = self.get_state(session_id)
         stored_loops = [
-            loop
+            dict(loop)
             for loop in state.get("open_loops", [])
             if isinstance(loop, dict)
         ]
@@ -298,7 +304,8 @@ class ConversationMemoryService:
             ttl_days=settings.ttl_days,
             max_open=settings.max_open_loops,
         )
-        state["open_loops"] = stored_loops
+        if not read_only and session_id in (getattr(self.plugin, "session_data", {}) or {}):
+            state["open_loops"] = stored_loops
         loops = [
             loop
             for loop in stored_loops

@@ -58,9 +58,13 @@ def reduce_segment_text(content: Any) -> str:
                         text_content += value
                         break
             elif hasattr(segment, "text"):
-                text_content += getattr(segment, "text", "")
+                val = getattr(segment, "text", None)
+                if isinstance(val, str):
+                    text_content += val
             elif hasattr(segment, "get_text"):
-                text_content += segment.get_text()
+                val = segment.get_text()
+                if isinstance(val, str):
+                    text_content += val
             elif isinstance(segment, str):
                 text_content += segment
         return text_content

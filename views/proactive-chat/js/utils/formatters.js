@@ -85,6 +85,21 @@ function getZonedDateParts(date, timeZone = 'Asia/Shanghai', options = {}) {
     };
 }
 
+// 前端展示时区必须跟随后端 AstrBot 调度时区；旧后端未返回时退回浏览器时区，
+// 不再硬编码 Asia/Shanghai。
+function resolveDisplayTimezone(config) {
+    const configured = config && config.displayTimezone;
+    if (configured && configured !== 'local') {
+        return configured;
+    }
+    try {
+        if (typeof Intl !== 'undefined' && Intl.DateTimeFormat) {
+            return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+        }
+    } catch (e) {}
+    return 'UTC';
+}
+
 function formatDateTime(value, timeZone = 'Asia/Shanghai', options = {}) {
     const parts = getZonedDateParts(value, timeZone, options);
     if (!parts) return '--';
@@ -187,6 +202,7 @@ function formatUnansweredLabel(currentCount, maxCount) {
 window.parseDateish = parseDateish;
 window.formatDateTime = formatDateTime;
 window.formatFriendlyTime = formatFriendlyTime;
+window.resolveDisplayTimezone = resolveDisplayTimezone;
 window.formatDuration = formatDuration;
 window.resolveSourceModeLabel = resolveSourceModeLabel;
 window.formatUnansweredLabel = formatUnansweredLabel;

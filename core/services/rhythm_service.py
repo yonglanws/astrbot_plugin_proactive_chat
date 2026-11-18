@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+import copy
+import inspect
 import random
 import time
 from datetime import datetime, timedelta
@@ -69,22 +71,26 @@ class RhythmService:
             "seed": {},
         }
 
-    def get_state(self, session_id: str, *, create: bool = False) -> dict[str, Any]:
+    def get_state(
+        self, session_id: str, *, create: bool = False, read_only: bool = False
+    ) -> dict[str, Any]:
         session_data = getattr(self.plugin, "session_data", None)
         if not isinstance(session_data, dict):
             return self.default_state()
         payload = session_data.get(session_id)
         if not isinstance(payload, dict):
-            if not create:
+            if not create or read_only:
                 return self.default_state()
             payload = {}
             session_data[session_id] = payload
         state = payload.get(RHYTHM_KEY)
         if not isinstance(state, dict):
-            if not create:
+            if not create or read_only:
                 return self.default_state()
             state = self.default_state()
             payload[RHYTHM_KEY] = state
+        if read_only:
+            state = copy.deepcopy(state)
 
         counts = state.get("hour_counts")
         if not isinstance(counts, list) or len(counts) != 24:
@@ -181,7 +187,15 @@ class RhythmService:
         if intensity_service is None:
             return
         try:
-            intensity_state = intensity_service.get_state(session_id)
+            get_state_fn = intensity_service.get_state
+            sig = inspect.signature(get_state_fn)
+            if "read_only" in sig.parameters or any(
+                p.kind is inspect.Parameter.VAR_KEYWORD
+                for p in sig.parameters.values()
+            ):
+                intensity_state = get_state_fn(session_id, read_only=True)
+            else:
+                intensity_state = get_state_fn(session_id)
             events = intensity_state.get("events", [])
         except Exception:
             return
@@ -208,12 +222,13 @@ class RhythmService:
         *,
         now: float | None = None,
         settings: RhythmSettings | None = None,
+        read_only: bool = False,
     ) -> list[int]:
         """返回学习到的活跃小时列表；样本不足时返回空列表。"""
         settings = settings or self.get_settings()
         if not settings.enabled or not settings.learn_active_hours:
             return []
-        state = self.get_state(session_id)
+        state = self.get_state(session_id, read_only=read_only)
         self._seed_from_intensity(session_id, state)
         total = float(sum(state.get("hour_counts", [])))
         if total < settings.min_messages_to_learn:
@@ -235,8 +250,11 @@ class RhythmService:
         settings: RhythmSettings,
         quiet_hours: str = "",
         weekend: bool = False,
+        read_only: bool = False,
     ) -> set[int]:
-        hours = self.learned_active_hours(session_id, settings=settings)
+        hours = self.learned_active_hours(
+            session_id, settings=settings, read_only=read_only
+        )
         if not hours:
             return set()
         margin = settings.active_hours_margin_minutes
@@ -392,6 +410,7 @@ class RhythmService:
         manual: bool = False,
         schedule_conf: Mapping[str, Any] | None = None,
         session_config: Mapping[str, Any] | None = None,
+        read_only: bool = False,
     ) -> tuple[bool, str, float]:
         """检查当前是否适合发送；返回 (allowed, reason, next_delay_seconds)。"""
         if manual:
@@ -401,7 +420,7 @@ class RhythmService:
         if not settings.enabled:
             return True, "disabled", 0.0
 
-        state = self.get_state(session_id)
+        state = self.get_state(session_id, read_only=read_only)
         last_proactive = float(state.get("last_proactive_ts", 0) or 0)
         min_gap = max(0, int(settings.min_gap_minutes)) * 60
         if last_proactive > 0 and min_gap > 0:
@@ -427,6 +446,7 @@ class RhythmService:
             settings=settings,
             quiet_hours=quiet_hours,
             weekend=self._local_datetime(current).weekday() >= 5,
+            read_only=read_only,
         )
         if allowed:
             local = self._local_datetime(current)
@@ -488,13 +508,14 @@ class RhythmService:
         *,
         now: float | None = None,
         session_config: Mapping[str, Any] | None = None,
+        read_only: bool = False,
     ) -> dict[str, Any]:
         timestamp = float(now if now is not None else time.time())
         settings = self.get_settings(session_config)
-        state = self.get_state(session_id)
+        state = self.get_state(session_id, read_only=read_only)
         self._seed_from_intensity(session_id, state)
         active_hours = self.learned_active_hours(
-            session_id, now=timestamp, settings=settings
+            session_id, now=timestamp, settings=settings, read_only=read_only
         )
         date_key = self._date_key(timestamp)
         daily_count = int(state.get("daily_proactive", {}).get(date_key, 0) or 0)
@@ -502,6 +523,7 @@ class RhythmService:
             session_id,
             now=timestamp,
             session_config=session_config,
+            read_only=read_only,
         )
         return {
             "enabled": settings.enabled,

@@ -37,8 +37,14 @@ const initialState = {
     selectedSession: '',
     // 当前选中会话的 base / override / effective 详情。
     sessionDetail: null,
-    // 主题优先读取本地存储，确保刷新页面后仍能保持用户偏好。
-    theme: (window.StorageUtil && window.StorageUtil.get('theme')) || 'light',
+    // 内嵌页面先沿用服务端注入的 data-theme（根节点已带 theme-dark），
+    // 避免 React 首次挂载时把暗色类移除造成白屏闪烁；独立页面再读本地偏好。
+    theme: (
+        typeof document !== 'undefined'
+        && document.documentElement.classList.contains('theme-dark')
+    )
+        ? 'dark'
+        : ((window.StorageUtil && window.StorageUtil.get('theme')) || 'light'),
 };
 
 function reducer(state, action) {

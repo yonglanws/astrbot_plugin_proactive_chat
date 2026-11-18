@@ -16,6 +16,7 @@ from astrbot.api.event import AstrMessageEvent
 
 from ..domain.humanization import ReplyQuality, classify_reply
 from ..domain.session_key import is_group_umo
+from ..store.session_store import SessionStore
 
 
 class EventHandlers:
@@ -28,16 +29,25 @@ class EventHandlers:
     # 内部辅助
     # ------------------------------------------------------------------
     def _migrate_raw_key(self, session_id: str, normalized_session_id: str) -> bool:
-        """把 raw 键的载荷并入规范键，返回是否有变更。"""
+        """把 raw 键的载荷安全合并到规范键，返回是否有变更。"""
         if (
             normalized_session_id == session_id
             or session_id not in self.plugin.session_data
         ):
             return False
         existing_payload = self.plugin.session_data.get(session_id, {})
-        self.plugin.session_data.setdefault(normalized_session_id, {}).update(
-            existing_payload
-        )
+        current_payload = self.plugin.session_data.get(normalized_session_id)
+        if isinstance(current_payload, dict) and isinstance(existing_payload, dict):
+            merge_fn = getattr(
+                getattr(self.plugin, "storage_service", None),
+                "merge_session_info",
+                SessionStore.merge_session_info,
+            )
+            self.plugin.session_data[normalized_session_id] = merge_fn(
+                current_payload, existing_payload
+            )
+        elif isinstance(existing_payload, dict):
+            self.plugin.session_data[normalized_session_id] = dict(existing_payload)
         del self.plugin.session_data[session_id]
         return True
 
@@ -64,6 +74,23 @@ class EventHandlers:
             return True
         return False
 
+    def _get_command_prefixes(self) -> tuple[str, ...]:
+        """读取 AstrBot 的唤醒/命令前缀，并补上常见全角写法。"""
+        prefixes: list[str] = ["/", "／"]
+        try:
+            config = self.plugin.context.get_config()
+            raw = config.get("wake_prefix", "/")
+            if isinstance(raw, str):
+                raw = [raw]
+            if isinstance(raw, (list, tuple, set)):
+                for item in raw:
+                    value = str(item or "").strip()
+                    if value and value not in prefixes:
+                        prefixes.append(value)
+        except Exception:
+            pass
+        return tuple(prefixes)
+
     @staticmethod
     def extract_event_text(event: AstrMessageEvent) -> str:
         """尽力提取私聊消息的纯文本，供互动强度评分使用。"""
@@ -89,6 +116,58 @@ class EventHandlers:
                 parts.append(component["text"])
         return "".join(parts).strip()
 
+    async def _persist_user_message_to_platform_history(
+        self,
+        event: AstrMessageEvent,
+        normalized_session_id: str,
+    ) -> None:
+        """把私聊用户消息补写进平台流水。
+
+        AstrBot 4.x 只对群聊和 webchat 私聊自动落库；QQ / aiocqhttp 等
+        普通私聊如果完全依赖平台流水模式，模型只能看到 Bot 自己说过的话。
+        这里按与主动消息相同的 platform_id + target_id 口径补写用户侧记录。
+        """
+        plugin = self.plugin
+        try:
+            parsed = plugin.session_service.parse_session_id(normalized_session_id)
+            if not parsed:
+                return
+            platform_id, _message_type, target_id = parsed
+            # webchat 由 AstrBot 自己写入，避免重复。
+            if platform_id == "webchat":
+                return
+
+            history_mgr = getattr(plugin.context, "message_history_manager", None)
+            insert_message_chain = getattr(history_mgr, "insert_message_chain", None)
+            if not callable(insert_message_chain):
+                return
+
+            from astrbot.core.message.message_event_result import MessageChain
+
+            sender_id = ""
+            sender_name = ""
+            try:
+                sender_id = str(event.get_sender_id() or "")
+            except Exception:
+                pass
+            try:
+                sender_name = str(event.get_sender_name() or "")
+            except Exception:
+                pass
+
+            await insert_message_chain(
+                platform_id=platform_id,
+                user_id=target_id,
+                message_chain=MessageChain(list(event.get_messages() or [])),
+                role="user",
+                sender_id=sender_id or None,
+                sender_name=sender_name or None,
+                # 与 AstrBot 内置群聊流水保持同一保留上限，避免无限增长。
+                max_messages=700,
+            )
+        except Exception as e:
+            logger.debug(f"[主动消息] 补写私聊用户流水失败喵: {e}")
+
     # ------------------------------------------------------------------
     # 私聊
     # ------------------------------------------------------------------
@@ -103,6 +182,50 @@ class EventHandlers:
             logger.debug(f"[主动消息] 忽略非私聊会话喵: {session_id}")
             return
 
+        # 平台把 Bot 自己的消息回投成事件时，不能把它算成用户回复。
+        try:
+            self_id = str(event.get_self_id() or "")
+            sender_id = str(event.get_sender_id() or "")
+            if self_id and sender_id and self_id == sender_id:
+                logger.debug("[主动消息] 忽略 Bot 自身消息回投喵。")
+                return
+        except Exception:
+            pass
+
+        message_text = self.extract_event_text(event)
+        # 命令消息不是“用户回复”，不更新强度、不清零未回复计数、
+        # 也不触发话题判定 LLM。
+        #
+        # AstrBot 在私聊里会先剥掉 wake_prefix，所以不能只判断消息是否以
+        # “/”开头；waking_check 命中任意 CommandFilter 后会写入
+        # parsed_params，用它判断最可靠。
+        missing = object()
+        try:
+            if event.get_extra("parsed_params", missing) is not missing:
+                logger.debug("[主动消息] 忽略命令消息喵。")
+                return
+        except Exception:
+            pass
+        if message_text.startswith(self._get_command_prefixes()):
+            logger.debug("[主动消息] 忽略命令消息喵。")
+            return
+        # 兜底：私聊未配置 wake_prefix 时，命令文本可能已被剥成纯指令名。
+        first_token = message_text.split(" ", 1)[0].strip().lower()
+        if first_token in {
+            "主动回复",
+            "主动回复状态",
+            "开启主动回复",
+            "关闭主动回复",
+            "主动回复开启",
+            "主动回复关闭",
+            "proactive",
+            "proactive_on",
+            "proactive_off",
+            "proactive_status",
+        }:
+            logger.debug("[主动消息] 忽略本插件指令消息喵。")
+            return
+
         normalized_session_id = self.plugin.session_service.normalize_session_id(
             session_id
         )
@@ -110,11 +233,15 @@ class EventHandlers:
             normalized_session_id
         )
         is_enabled = bool(session_config and session_config.get("enable", False))
+        if not is_enabled:
+            logger.debug(
+                f"[主动消息] {self.plugin.session_service.get_session_log_str(session_id, session_config)} 未启用或配置无效，跳过处理喵。"
+            )
+            return
 
         # 先在锁外记录内存态消息时间，供后续逻辑即时读取。
         current_time = time.time()
         self._mark_memory_message_time(normalized_session_id, current_time)
-        message_text = self.extract_event_text(event)
 
         state_service = getattr(self.plugin, "conversation_state_service", None)
         feedback_settings = None
@@ -146,14 +273,23 @@ class EventHandlers:
             and feedback_settings.perfunctory_no_reset
         )
 
+        # 在锁内读取暂停状态与 paused_at，避免与并发暂停流程交错。
+        async with self.plugin.data_lock:
+            self._migrate_raw_key(session_id, normalized_session_id)
+            pre_payload = self.plugin.session_data.get(normalized_session_id, {})
+            was_paused = bool(
+                self.plugin.scheduler_service.is_session_paused(
+                    normalized_session_id
+                )
+            )
+            paused_at_before = (
+                pre_payload.get("paused_at")
+                if isinstance(pre_payload, dict)
+                else None
+            )
+
         # 暂停期间用户发来消息：先让话题判定器决定是否真正恢复。
         # LLM 调用必须在 data_lock 之外，避免长时间持有锁阻塞其他任务。
-        was_paused = bool(
-            is_enabled
-            and self.plugin.scheduler_service.is_session_paused(
-                normalized_session_id
-            )
-        )
         resume_allowed = True
         judge_result: dict | None = None
         if was_paused and (is_negative or is_perfunctory):
@@ -188,19 +324,51 @@ class EventHandlers:
         keep_paused = bool(was_paused and not resume_allowed)
 
         async with self.plugin.data_lock:
-            # 判定期间管理端可能已经手动恢复：以锁内最新状态为准。
-            if keep_paused and not self.plugin.scheduler_service.is_session_paused(
-                normalized_session_id
-            ):
-                keep_paused = False
-
-            # 先迁移旧键，再写入 self_id，避免历史值覆盖当前值。
+            # 先迁移旧键，再读取锁内最新暂停状态，防止并发暂停被覆盖。
             self._migrate_raw_key(session_id, normalized_session_id)
+            payload = self.plugin.session_data.setdefault(
+                normalized_session_id, {}
+            )
+            now_paused = bool(
+                self.plugin.scheduler_service.is_session_paused(
+                    normalized_session_id
+                )
+            )
+            paused_at_now = payload.get("paused_at")
 
-            if event.get_self_id():
-                self.plugin.session_data.setdefault(normalized_session_id, {})[
-                    "self_id"
-                ] = event.get_self_id()
+            if keep_paused:
+                # 判定期间管理端可能已经手动恢复：以锁内最新状态为准。
+                if not now_paused:
+                    keep_paused = False
+            else:
+                # 在锁外等待期间，若并发任务（如上限触发或负反馈）刚把会话暂停，
+                # 或写入了更新的暂停时间戳，绝不误调用 resume_session()。
+                if (not was_paused and now_paused) or (
+                    was_paused
+                    and now_paused
+                    and paused_at_now is not None
+                    and paused_at_now != paused_at_before
+                ):
+                    keep_paused = True
+
+            try:
+                self_id = str(event.get_self_id() or "")
+                if self_id:
+                    payload["self_id"] = self_id
+            except Exception:
+                pass
+            try:
+                sender_id = str(event.get_sender_id() or "")
+                if sender_id:
+                    payload["last_sender_id"] = sender_id
+            except Exception:
+                pass
+            try:
+                sender_name = str(event.get_sender_name() or "")
+                if sender_name:
+                    payload["last_sender_name"] = sender_name
+            except Exception:
+                pass
 
             self._mark_persisted_message_time(normalized_session_id, current_time)
 
@@ -314,6 +482,13 @@ class EventHandlers:
                         logger.warning(
                             f"[主动消息] 负反馈暂停失败喵: {e}"
                         )
+
+        # 启用会话顺手补齐用户侧平台流水，保证“平台流水/混合模式”有真实对话可看。
+        # 放在锁外执行，避免数据库 IO 长时间阻塞其他会话。
+        if is_enabled:
+            await self._persist_user_message_to_platform_history(
+                event, normalized_session_id
+            )
 
         auto_trigger_cancelled = (
             await self.plugin.scheduler_service.cancel_all_related_auto_triggers(

@@ -10,6 +10,8 @@ import re
 import time
 from typing import Any, Iterable, Mapping
 
+from .humanization import has_question
+
 PLAN_PATTERN = re.compile(
     r"(明天|后天|大后天|下周[一二三四五六日天]?|周末|今晚|今天晚上|"
     r"等会|等会儿|待会|待会儿|晚点|回头|下次|一会儿|月底|下个月|"
@@ -99,6 +101,49 @@ def _fingerprint(kind: str, text: str) -> str:
     return f"{kind}:{normalized[:48]}"
 
 
+_DUE_HINT_MAX_DAYS: dict[str, float] = {
+    "等会": 0.5,
+    "等会儿": 0.5,
+    "待会": 0.5,
+    "待会儿": 0.5,
+    "一会儿": 0.5,
+    "晚点": 0.8,
+    "今晚": 1.0,
+    "今天晚上": 1.0,
+    "明天": 2.0,
+    "后天": 3.0,
+    "大后天": 4.0,
+    "周末": 7.0,
+    "下周": 9.0,
+}
+
+
+def _due_days_for(due_hint: str) -> float | None:
+    hint = str(due_hint or "").strip()
+    if not hint:
+        return None
+    if hint in _DUE_HINT_MAX_DAYS:
+        return _DUE_HINT_MAX_DAYS[hint]
+    if hint.startswith("下周"):
+        return 9.0
+    return None
+
+
+def _subsequence_match(keyword: str, content: str) -> bool:
+    """允许如 '面试' 匹配 '面完试'（字符按序出现且跨度不超过 len+2）。"""
+    if len(keyword) < 2 or len(keyword) > 4:
+        return False
+    pos = -1
+    first = -1
+    for ch in keyword:
+        pos = content.find(ch, pos + 1)
+        if pos == -1:
+            return False
+        if first == -1:
+            first = pos
+    return (pos - first) <= len(keyword) + 2
+
+
 def extract_loop_candidates(
     text: str,
     *,
@@ -138,7 +183,7 @@ def extract_loop_candidates(
                 }
             )
 
-    if role == "assistant" and QUESTION_PATTERN.search(content):
+    if role == "assistant" and has_question(content):
         loops.append(
             {
                 "kind": "question",
@@ -161,8 +206,9 @@ def loop_matches_text(loop: Mapping[str, Any], text: str) -> bool:
     if not content:
         return False
     for keyword in loop.get("keywords", []) or []:
-        if isinstance(keyword, str) and len(keyword) >= 2 and keyword in content:
-            return True
+        if isinstance(keyword, str) and len(keyword) >= 2:
+            if keyword in content or _subsequence_match(keyword, content):
+                return True
     due_hint = str(loop.get("due_hint") or "")
     return bool(due_hint and due_hint in content)
 
@@ -203,6 +249,9 @@ def format_open_loops(loops: Iterable[Mapping[str, Any]], *, now: float) -> str:
             "topic": "话题",
         }.get(kind, "话题")
         age_days = max(0.0, (now - float(loop.get("created_at", 0) or 0)) / 86400)
+        due_days = _due_days_for(str(loop.get("due_hint") or ""))
+        if kind in {"plan", "event"} and due_days is not None and age_days > due_days:
+            label = "近期事件（可能已结束，可自然问结果）"
         if age_days >= 1:
             age = f"，约 {int(age_days)} 天前"
         else:
@@ -229,7 +278,7 @@ def update_profile(
     """用指数移动平均维护轻量用户画像。"""
     content = _clean(text)
     length = len(content)
-    has_question = 1.0 if QUESTION_PATTERN.search(content) else 0.0
+    has_q = 1.0 if has_question(content) else 0.0
     has_emoji = 1.0 if _EMOJI_RE.search(content) else 0.0
 
     count = int(profile.get("message_count", 0) or 0) + 1
@@ -241,7 +290,7 @@ def update_profile(
 
     profile["message_count"] = count
     profile["avg_length"] = round(_blend("avg_length", float(length)), 2)
-    profile["question_ratio"] = round(_blend("question_ratio", has_question), 4)
+    profile["question_ratio"] = round(_blend("question_ratio", has_q), 4)
     profile["emoji_ratio"] = round(_blend("emoji_ratio", has_emoji), 4)
     profile["last_quality"] = quality
     profile["updated_at"] = now
@@ -270,12 +319,21 @@ def prune_loops(
     """关闭过期话题，并裁剪开放话题数量。"""
     ttl_seconds = max(1.0, float(ttl_days)) * 86400
     for loop in loops:
-        if loop.get("status") == "open" and now - float(
-            loop.get("created_at", 0) or 0
-        ) > ttl_seconds:
+        if loop.get("status") != "open":
+            continue
+        created_at = float(loop.get("created_at", 0) or 0)
+        age_seconds = max(0.0, now - created_at)
+        if age_seconds > ttl_seconds:
             loop["status"] = "closed"
             loop["closed_at"] = now
             loop["close_reason"] = "ttl"
+            continue
+        if loop.get("kind") in {"plan", "event"}:
+            due_days = _due_days_for(str(loop.get("due_hint") or ""))
+            if due_days is not None and age_seconds > (due_days + 2.5) * 86400:
+                loop["status"] = "closed"
+                loop["closed_at"] = now
+                loop["close_reason"] = "due_passed"
     open_loops = [loop for loop in loops if loop.get("status") == "open"]
     closed_loops = [loop for loop in loops if loop.get("status") != "open"]
     open_loops.sort(key=lambda item: float(item.get("created_at", 0) or 0), reverse=True)

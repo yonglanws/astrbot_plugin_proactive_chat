@@ -57,6 +57,7 @@ function ConfigEditor() {
     const setConfig = loader.setConfig;
     const sessions = loader.sessions;
     const sessionConfigState = loader.sessionConfigState;
+    const providers = loader.providers;
 
     // 仅追踪“模式 + 当前有效会话”，全局模式下切换选中会话不触发重复加载。
     const loadContextKey = mode === 'session' ? `session:${selectedSession}` : 'global';
@@ -73,6 +74,17 @@ function ConfigEditor() {
         scrollContainerRef: scrollContainerRef,
     });
 
+    // 有未保存修改时拦截刷新/关闭，配合草稿恢复减少误丢失。
+    useEffect(() => {
+        const onBeforeUnload = (event) => {
+            if (!isDirtyRef.current) return;
+            event.preventDefault();
+            event.returnValue = '';
+        };
+        window.addEventListener('beforeunload', onBeforeUnload);
+        return () => window.removeEventListener('beforeunload', onBeforeUnload);
+    }, []);
+
     // 默认选中第一个会话，避免会话模式初始为空。
     useEffect(() => {
         if (selectedSession || sessions.length === 0) return;
@@ -88,7 +100,19 @@ function ConfigEditor() {
         // 过期请求会被 loadConfig 丢弃但仍正常 resolve，必须按采纳标记决定是否写入
         loader.loadConfig(mode, selectedSession).then((applied) => {
             if (!applied) return;
-            isDirtyRef.current = false;
+            const cachedDraft = draft.readDraft(mode, selectedSession);
+            if (cachedDraft) {
+                // 服务端配置加载完成后叠加未保存草稿，避免刷新/切换会话丢失编辑。
+                // 密码字段不会由服务端返回；旧草稿里的空密码不能反向覆盖真实密码。
+                if (cachedDraft.web_admin) {
+                    delete cachedDraft.web_admin.password;
+                }
+                isDirtyRef.current = true;
+                setConfig((prev) => ({ ...(prev || {}), ...cachedDraft }));
+                setSaveFeedback({ type: 'info', text: '已恢复上次未保存的配置草稿，请确认后保存' });
+            } else {
+                isDirtyRef.current = false;
+            }
             setExpandedKeys(draft.restoreExpandedKeys(mode, selectedSession));
         });
         // 依赖只保留上下文标识；loader/draft 每次渲染都是新引用，不能直接作为依赖。
@@ -196,7 +220,7 @@ function ConfigEditor() {
     };
 
     const handleRestoreDefaults = async () => {
-        const ok = await window.ProactiveUI.confirm('⚠️ 确定要恢复出厂设置吗？\n\n这将覆盖当前所有配置项为默认值（需要点击“保存配置”才能生效）。');
+        const ok = await window.ProactiveUI.confirm('⚠️ 确定要恢复出厂设置吗？\n\n这将覆盖当前所有配置项为默认值（需要点击“保存配置”才能生效）。\n会话白名单 session_list 与管理端密码会被保留。');
         if (!ok) return;
 
         if (mode === 'session') {
@@ -212,6 +236,17 @@ function ConfigEditor() {
             setConfig(sessionDefaults);
         } else {
             const defaults = generateDefaults(schema);
+            // session_list 是用户手工维护的会话白名单，不能被“恢复默认”清空；
+            // 管理端密码不在前端返回中，也不写入默认值，避免保存时被空串覆盖。
+            if (defaults.private_settings && config && config.private_settings) {
+                const currentList = config.private_settings.session_list;
+                if (Array.isArray(currentList)) {
+                    defaults.private_settings.session_list = currentList;
+                }
+            }
+            if (defaults.web_admin) {
+                delete defaults.web_admin.password;
+            }
             isDirtyRef.current = true;
             setConfig(defaults);
         }
@@ -381,6 +416,7 @@ function ConfigEditor() {
                                 path=""
                                 expandedKeys={expandedKeys}
                                 onToggleExpand={handleToggleExpand}
+                                providers={providers}
                             />
                         </Box>
                     ))}

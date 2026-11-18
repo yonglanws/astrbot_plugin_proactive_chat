@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import copy
+import inspect
 import math
 import time
 from datetime import datetime
@@ -33,6 +35,65 @@ class StateBuilder:
         self._metadata_version = metadata_version
         # WebSocket 连接计数由实时通道提供，供状态载荷展示连接状态。
         self._connection_counter = connection_counter or (lambda: 0)
+
+    @staticmethod
+    def _coerce_int(value: Any, default: int = 0) -> int:
+        if value is None or isinstance(value, bool):
+            return default
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _safe_session_keys(self) -> list[str]:
+        """安全获取 session_data 键列表，避免并发修改引发 RuntimeError。"""
+        session_data = getattr(self.plugin, "session_data", None)
+        if not isinstance(session_data, dict):
+            return []
+        for _ in range(3):
+            try:
+                return list(session_data.keys())
+            except RuntimeError:
+                continue
+        return []
+
+    def _safe_session_snapshot(self, session_id: str) -> dict[str, Any]:
+        """返回指定会话数据的隔离快照，避免 UI 轮询读取到半修改状态。"""
+        session_data = getattr(self.plugin, "session_data", None)
+        if not isinstance(session_data, dict):
+            return {}
+        raw = session_data.get(session_id)
+        if not isinstance(raw, dict):
+            return {}
+        for _ in range(3):
+            try:
+                return copy.deepcopy(raw)
+            except RuntimeError:
+                continue
+        return dict(raw)
+
+    def _safe_auto_trigger_items(self) -> list[tuple[str, Any]]:
+        """安全获取自动触发计时器快照列表。"""
+        timers = getattr(self.plugin, "auto_trigger_timers", None)
+        if not isinstance(timers, dict):
+            return []
+        for _ in range(3):
+            try:
+                return list(timers.items())
+            except RuntimeError:
+                continue
+        return []
+
+    @staticmethod
+    def _accepts_read_only(fn: Any) -> bool:
+        try:
+            sig = inspect.signature(fn)
+        except (TypeError, ValueError):
+            return False
+        params = sig.parameters
+        if "read_only" in params:
+            return True
+        return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
 
     # ------------------------------------------------------------------
     # 计时器元信息
@@ -89,25 +150,36 @@ class StateBuilder:
         plugin = self.plugin
         auto_cards: list[dict[str, Any]] = []
 
-        for session_id, timer in list(plugin.auto_trigger_timers.items()):
+        for session_id, timer in self._safe_auto_trigger_items():
             if not self.is_private_umo(str(session_id)):
                 continue
             normalized_session_id = plugin.session_service.normalize_session_id(
                 str(session_id)
             )
             session_config = plugin.config_service.get_session_config(session_id) or {}
-            session_data = plugin.session_data.get(session_id, {})
+            session_data = self._safe_session_snapshot(session_id)
+            if not session_data and normalized_session_id != str(session_id):
+                session_data = self._safe_session_snapshot(normalized_session_id)
             auto_settings = session_config.get("auto_trigger_settings", {})
             schedule_settings = session_config.get("schedule_settings", {})
             context_settings = session_config.get("context_settings", {})
-            trigger_delay_minutes = int(
-                auto_settings.get("auto_trigger_after_minutes", 0) or 0
+            trigger_delay_minutes = self._coerce_int(
+                auto_settings.get("auto_trigger_after_minutes", 0), 0
             )
             trigger_delay_seconds = max(0, trigger_delay_minutes * 60)
             timer_meta = self.safe_timer_meta(timer, now)
             remaining_seconds = timer_meta["remaining_seconds"]
             target_time = timer_meta["target_time"]
-            started_at = max(plugin.plugin_start_time, now - trigger_delay_seconds)
+            if target_time is not None:
+                started_at = min(
+                    now,
+                    max(
+                        plugin.plugin_start_time,
+                        target_time - trigger_delay_seconds,
+                    ),
+                )
+            else:
+                started_at = min(now, plugin.plugin_start_time)
             progress_percent = 0
             if trigger_delay_seconds > 0 and remaining_seconds is not None:
                 consumed = max(0, trigger_delay_seconds - remaining_seconds)
@@ -129,8 +201,8 @@ class StateBuilder:
                     "source_mode": context_settings.get(
                         "source_mode", "conversation_history"
                     ),
-                    "max_unanswered_times": schedule_settings.get(
-                        "max_unanswered_times", 0
+                    "max_unanswered_times": self._coerce_int(
+                        schedule_settings.get("max_unanswered_times", 4), 4
                     ),
                     "timer_kind": "auto_trigger",
                     "title": "自动触发检测",
@@ -165,6 +237,8 @@ class StateBuilder:
         if service is None:
             return {}
         try:
+            if self._accepts_read_only(service.evaluate):
+                return service.evaluate(session_id, read_only=True)
             return service.evaluate(session_id)
         except Exception:
             return {}
@@ -183,8 +257,8 @@ class StateBuilder:
         plugin = self.plugin
         results: list[dict[str, Any]] = []
         for session_id in self.list_known_sessions():
-            info = plugin.session_data.get(session_id)
-            if not isinstance(info, dict) or not info.get(PAUSE_FLAG):
+            info = self._safe_session_snapshot(session_id)
+            if not info or not info.get(PAUSE_FLAG):
                 continue
 
             session_config = (
@@ -268,7 +342,10 @@ class StateBuilder:
         if service is None:
             return {}
         try:
-            return service.summary(self.list_known_sessions())
+            sessions = self.list_known_sessions()
+            if self._accepts_read_only(service.summary):
+                return service.summary(sessions, read_only=True)
+            return service.summary(sessions)
         except Exception:
             return {}
 
@@ -302,6 +379,8 @@ class StateBuilder:
             "intensity_summary": self.build_intensity_summary(),
             "memory_status": self._memory_status(),
             "ws_connections": self._connection_counter(),
+            "plugin_set_warning": getattr(plugin, "plugin_set_warning", "") or "",
+            "timezone": str(getattr(plugin, "timezone", "") or ""),
             "timestamp": datetime.now().isoformat(),
         }
 
@@ -315,11 +394,11 @@ class StateBuilder:
             return []
 
         jobs = []
-        for job in plugin.scheduler.get_jobs():
+        for job in list(plugin.scheduler.get_jobs() or []):
             session_id = str(job.id)
             if not self.is_private_umo(session_id):
                 continue
-            session_data = plugin.session_data.get(session_id, {})
+            session_data = self._safe_session_snapshot(session_id)
             session_config = plugin.config_service.get_session_config(session_id) or {}
             schedule_settings = session_config.get("schedule_settings", {})
             context_settings = session_config.get("context_settings", {})
@@ -342,9 +421,12 @@ class StateBuilder:
                     "source_mode": context_settings.get(
                         "source_mode", "conversation_history"
                     ),
-                    "max_unanswered_times": schedule_settings.get(
-                        "max_unanswered_times",
-                        auto_trigger_settings.get("max_unanswered_times", 0),
+                    "max_unanswered_times": self._coerce_int(
+                        schedule_settings.get(
+                            "max_unanswered_times",
+                            auto_trigger_settings.get("max_unanswered_times", 4),
+                        ),
+                        4,
                     ),
                     "next_run_time": (
                         job.next_run_time.isoformat() if job.next_run_time else None
@@ -416,11 +498,11 @@ class StateBuilder:
                 if self.is_private_umo(normalized):
                     sessions.add(normalized)
 
-        for session in plugin.session_data.keys():
+        for session in self._safe_session_keys():
             if self.is_private_umo(session):
                 sessions.add(session)
 
-        for session in plugin.session_override_manager.list_sessions():
+        for session in list(plugin.session_override_manager.list_sessions() or []):
             if self.is_private_umo(session):
                 sessions.add(session)
 
@@ -433,6 +515,7 @@ class StateBuilder:
         for session in self.list_known_sessions():
             effective = plugin.config_service.get_session_config(session)
             intensity = self._intensity_snapshot(session)
+            session_info = self._safe_session_snapshot(session)
             result.append(
                 {
                     "session": session,
@@ -445,22 +528,13 @@ class StateBuilder:
                     "has_override": bool(
                         plugin.session_override_manager.get_override(session)
                     ),
-                    "unanswered_count": plugin.session_data.get(session, {}).get(
-                        "unanswered_count", 0
-                    ),
+                    "unanswered_count": session_info.get("unanswered_count", 0),
                     "manual_trigger_in_progress": session
                     in plugin.manual_trigger_sessions,
-                    "paused": bool(
-                        (plugin.session_data.get(session) or {}).get(PAUSE_FLAG)
-                    ),
-                    "paused_at": (plugin.session_data.get(session) or {}).get(
-                        PAUSE_AT
-                    ),
+                    "paused": bool(session_info.get(PAUSE_FLAG)),
+                    "paused_at": session_info.get(PAUSE_AT),
                     "paused_unanswered_count": int(
-                        (plugin.session_data.get(session) or {}).get(
-                            PAUSE_UNANSWERED, 0
-                        )
-                        or 0
+                        session_info.get(PAUSE_UNANSWERED, 0) or 0
                     ),
                     "intensity_score": intensity.get("score"),
                     "intensity_tier": intensity.get("tier"),
@@ -485,7 +559,11 @@ class StateBuilder:
         if service is None:
             return []
 
-        snapshots = service.collect_snapshots(self.list_known_sessions())
+        known_sessions = self.list_known_sessions()
+        if self._accepts_read_only(service.collect_snapshots):
+            snapshots = service.collect_snapshots(known_sessions, read_only=True)
+        else:
+            snapshots = service.collect_snapshots(known_sessions)
         for item in snapshots:
             session_id = item.get("session_id", "")
             session_config = (

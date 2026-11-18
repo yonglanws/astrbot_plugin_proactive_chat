@@ -8,10 +8,14 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 from astrbot.api import logger
+
+from ..domain.session_key import SessionKey
 
 
 class OverrideStore:
@@ -34,12 +38,40 @@ class OverrideStore:
         "humanization_settings",
     }
 
-    def __init__(self, storage_dir: Path):
+    def __init__(
+        self,
+        storage_dir: Path,
+        *,
+        normalizer: Callable[[str], str] | None = None,
+    ):
         self.storage_dir = Path(storage_dir)
         self.overrides_file = self.storage_dir / self.OVERRIDES_FILE
         self._overrides: dict[str, dict[str, Any]] = {}
         self._lock = asyncio.Lock()
+        self._normalizer = normalizer
         self._load()
+
+    def set_normalizer(
+        self, normalizer: Callable[[str], str] | None
+    ) -> None:
+        """设置外部会话键规范化回调（通常由生命周期服务注入）。"""
+        self._normalizer = normalizer
+
+    def _normalize_session_id(self, session_id: str) -> str:
+        raw = str(session_id or "").strip()
+        if not raw:
+            return raw
+        if self._normalizer is not None:
+            try:
+                normalized = str(self._normalizer(raw) or "").strip()
+                if normalized:
+                    raw = normalized
+            except Exception:
+                pass
+        key = SessionKey.parse(raw)
+        if key is not None:
+            return f"{key.platform}:{key.message_type}:{key.target_id}"
+        return raw
 
     def _ensure_storage_dir(self) -> None:
         """确保存储目录存在。"""
@@ -69,7 +101,9 @@ class OverrideStore:
     async def _save(self) -> None:
         """异步保存会话差异配置到磁盘，避免阻塞事件循环。"""
         self._ensure_storage_dir()
-        temp_file = self.overrides_file.with_suffix(self.overrides_file.suffix + ".tmp")
+        temp_file = self.overrides_file.with_name(
+            f"{self.overrides_file.name}.{uuid.uuid4().hex}.tmp"
+        )
         snap_overrides = copy.deepcopy(self._overrides)
 
         def _do_write():
@@ -93,7 +127,11 @@ class OverrideStore:
 
     def get_override(self, session_id: str) -> dict[str, Any]:
         """读取会话差异配置（返回深拷贝，调用方修改不影响内部状态）。"""
-        return copy.deepcopy(self._overrides.get(session_id, {}))
+        normalized = self._normalize_session_id(session_id)
+        if normalized in self._overrides:
+            return copy.deepcopy(self._overrides[normalized])
+        raw = str(session_id or "").strip()
+        return copy.deepcopy(self._overrides.get(raw, {}))
 
     async def set_override(
         self, session_id: str, override_patch: dict[str, Any]
@@ -102,19 +140,27 @@ class OverrideStore:
         if not isinstance(override_patch, dict):
             raise ValueError("override_patch 必须是对象")
 
+        raw = str(session_id or "").strip()
+        normalized = self._normalize_session_id(session_id)
         patch = self._sanitize_patch(copy.deepcopy(override_patch))
         async with self._lock:
+            if raw and raw != normalized:
+                self._overrides.pop(raw, None)
             if patch:
-                self._overrides[session_id] = patch
+                self._overrides[normalized] = patch
             else:
-                self._overrides.pop(session_id, None)
+                self._overrides.pop(normalized, None)
 
             await self._save()
 
     async def delete_override(self, session_id: str) -> None:
         """删除指定会话的差异配置。"""
+        raw = str(session_id or "").strip()
+        normalized = self._normalize_session_id(session_id)
         async with self._lock:
-            self._overrides.pop(session_id, None)
+            if raw and raw != normalized:
+                self._overrides.pop(raw, None)
+            self._overrides.pop(normalized, None)
             await self._save()
 
     def get_effective(
@@ -122,7 +168,7 @@ class OverrideStore:
     ) -> dict[str, Any]:
         """把全局基础配置与会话差异配置深合并，得到最终生效配置。"""
         base = copy.deepcopy(base_config or {})
-        override = self._overrides.get(session_id, {})
+        override = self.get_override(session_id)
         return self.deep_merge(base, override)
 
     async def update_session_from_effective(
@@ -142,7 +188,7 @@ class OverrideStore:
 
         patch = self.compute_diff(sanitized_base, sanitized_effective)
         patch = self._sanitize_patch(patch)
-        await self.set_override(session_id, patch or {})
+        await self.set_override(self._normalize_session_id(session_id), patch or {})
 
     @classmethod
     def deep_merge(cls, base: Any, patch: Any) -> Any:

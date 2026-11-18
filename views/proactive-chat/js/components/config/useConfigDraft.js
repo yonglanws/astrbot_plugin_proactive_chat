@@ -63,6 +63,23 @@
             }
         }, [expandedKeys, schema, getExpandedKey]);
 
+        // 读取并解析当前上下文对应的草稿；损坏或旧格式直接丢弃，避免阻塞配置页。
+        const readDraft = React.useCallback((currentMode, currentSession) => {
+            const cached = window.StorageUtil
+                ? window.StorageUtil.get(getDraftKey(currentMode, currentSession))
+                : null;
+            if (!cached) return null;
+            try {
+                const parsed = JSON.parse(cached);
+                return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+                    ? parsed
+                    : null;
+            } catch (e) {
+                console.error('解析配置草稿失败', e);
+                return null;
+            }
+        }, [getDraftKey]);
+
         const restoreExpandedKeys = React.useCallback((currentMode, currentSession) => {
             const cached = window.StorageUtil ? window.StorageUtil.get(getExpandedKey(currentMode, currentSession)) : null;
             if (!cached) return window.ConfigShared.getAllExpandablePaths(schema || {});
@@ -86,6 +103,7 @@
             getDraftKey: getDraftKey,
             getExpandedKey: getExpandedKey,
             scrollKey: scrollKey,
+            readDraft: readDraft,
             restoreExpandedKeys: restoreExpandedKeys,
         };
     }

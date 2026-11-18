@@ -6,6 +6,7 @@ from astrbot.api import logger
 
 from ..domain.domain_enums import HookPoint, StageResult
 from ..pipeline.stage_protocol import BaseStage
+from .guard_feature import _sync_rewritten_llm_response
 from .plan_feature import build_generation_context
 
 
@@ -46,14 +47,28 @@ class CriticStage(BaseStage):
             return StageResult.CONTINUE
 
         extra["critic"] = result
+        session_service = getattr(plugin, "session_service", None)
+        state_session_id = (
+            session_service.normalize_session_id(ctx.session_id)
+            if session_service is not None
+            and callable(getattr(session_service, "normalize_session_id", None))
+            else ctx.session_id
+        )
         try:
-            payload = plugin.session_data.setdefault(ctx.session_id, {})
-            payload["last_critic"] = {
+            critic_record = {
                 "at": ctx.started_at,
                 "allowed": bool(result.get("allowed")),
                 "reason": str(result.get("reason") or "")[:200],
                 "rewritten": bool(result.get("rewritten")),
             }
+            lock = getattr(plugin, "data_lock", None)
+            if lock is not None:
+                async with lock:
+                    payload = plugin.session_data.setdefault(state_session_id, {})
+                    payload["last_critic"] = critic_record
+            else:
+                payload = plugin.session_data.setdefault(state_session_id, {})
+                payload["last_critic"] = critic_record
         except Exception:
             pass
 
@@ -68,11 +83,30 @@ class CriticStage(BaseStage):
 
         if result.get("rewritten"):
             rewritten = str(result.get("text") or "").strip()
+            guard_service = getattr(plugin, "guard_service", None)
+            if guard_service is not None and rewritten:
+                try:
+                    guard_settings = guard_service.get_settings(session_config)
+                    if guard_settings.enabled:
+                        guard_reasons = guard_service.check_text(
+                            state_session_id, rewritten, settings=guard_settings
+                        )
+                        if guard_reasons:
+                            logger.info(
+                                f"[主动消息] critic 改写结果未通过自然度守卫（{', '.join(guard_reasons)}），"
+                                "已放弃并重新调度喵。"
+                            )
+                            extra["retry_after_seconds"] = 900
+                            ctx.abort("critic_rewrite_guard_blocked")
+                            return StageResult.RESCHEDULE
+                except Exception as e:
+                    logger.debug(f"[主动消息] 复核 critic 改写文本失败喵: {e}")
             non_plain = [
                 comp for comp in chain if type(comp).__name__ != "Plain"
             ]
             extra["response_text"] = rewritten
             extra["result_chain"] = non_plain
+            _sync_rewritten_llm_response(extra.get("llm_response"), rewritten)
             logger.info("[主动消息] critic 已替换为改写后的文本喵。")
         return StageResult.CONTINUE
 

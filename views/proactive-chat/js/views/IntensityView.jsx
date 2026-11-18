@@ -211,7 +211,7 @@ function IntensityCard({ session, displayTimezone }) {
 function IntensityView() {
     const { state } = useAppContext();
     const api = useApi();
-    const displayTimezone = state.config?.displayTimezone || 'Asia/Shanghai';
+    const displayTimezone = window.resolveDisplayTimezone(state.config);
     const [data, setData] = useState({ sessions: [], summary: {} });
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState('');

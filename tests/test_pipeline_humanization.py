@@ -126,7 +126,7 @@ class FakeSchedulerService:
 
 
 class FakeContextService:
-    async def prepare_llm_request(self, session_id):
+    async def prepare_llm_request(self, session_id, **kwargs):
         return {
             "conv_id": "conv1",
             "history": [
@@ -155,7 +155,7 @@ class FakeSender:
     def build_proactive_event(self, session_id):
         return SimpleNamespace(session_id=session_id)
 
-    async def send_proactive_message(self, session_id, text, event=None, initial_chain=None, delivery_plan=None):
+    async def send_proactive_message(self, session_id, text, event=None, initial_chain=None, delivery_plan=None, abort_check=None):
         self.sent.append(
             {
                 "session_id": session_id,
@@ -236,7 +236,7 @@ async def _fake_invoke_provider(provider, req):
     )
 
 
-async def _noop_add_message_pair(*args, **kwargs):
+async def _noop_add_assistant_message(*args, **kwargs):
     return None
 
 
@@ -251,8 +251,8 @@ def test_full_pipeline_runs_humanization(monkeypatch):
     )
     monkeypatch.setattr(LlmService, "resolve_chat_provider", _fake_resolve_provider)
     monkeypatch.setattr(
-        "astrbot_plugin_proactive_chat.core.pipeline.flow_orchestrator.add_message_pair",
-        _noop_add_message_pair,
+        "astrbot_plugin_proactive_chat.core.pipeline.flow_orchestrator.add_assistant_message",
+        _noop_add_assistant_message,
     )
     monkeypatch.setattr(
         "astrbot_plugin_proactive_chat.core.pipeline.flow_orchestrator.verify_message_persisted",

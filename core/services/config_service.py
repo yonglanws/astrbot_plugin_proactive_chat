@@ -127,6 +127,43 @@ class ConfigService:
             raise
 
     # ------------------------------------------------------------------
+    # Provider 选择
+    # ------------------------------------------------------------------
+    def list_chat_providers(self) -> list[dict[str, Any]]:
+        """列出 AstrBot 已加载的聊天 Provider（不包含密钥）。"""
+        manager = getattr(self.plugin.context, "provider_manager", None)
+        instances = getattr(manager, "provider_insts", None)
+        if not isinstance(instances, list):
+            return []
+
+        providers: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for instance in instances:
+            try:
+                meta = instance.meta()
+            except Exception:
+                continue
+            provider_id = str(getattr(meta, "id", "") or "").strip()
+            if not provider_id or provider_id in seen:
+                continue
+            seen.add(provider_id)
+            model = str(getattr(meta, "model", "") or "").strip()
+            provider_type = str(getattr(meta, "type", "") or "").strip()
+            label = provider_id
+            if model:
+                label = f"{provider_id} · {model}"
+            providers.append(
+                {
+                    "id": provider_id,
+                    "label": label,
+                    "model": model,
+                    "type": provider_type,
+                }
+            )
+        providers.sort(key=lambda item: item["label"].lower())
+        return providers
+
+    # ------------------------------------------------------------------
     # 会话配置
     # ------------------------------------------------------------------
     def get_session_config(self, session_id: str) -> dict | None:
@@ -188,11 +225,24 @@ class ConfigService:
             session_id
         )
         candidates = {session_id, normalized_session_id, target_id}
+        in_session_list = any(candidate in session_list for candidate in candidates)
 
-        if any(candidate in session_list for candidate in candidates):
+        # 会话级显式开启（例如通过 /开启主动回复 指令写入 enable=true）
+        # 也应获得一份基础配置，不再强制要求把 UMO 写进全局 session_list。
+        manager = getattr(self.plugin, "session_override_manager", None)
+        override = (
+            manager.get_override(normalized_session_id)
+            if manager is not None
+            else {}
+        )
+        explicitly_enabled = bool(
+            isinstance(override, dict) and override.get("enable") is True
+        )
+
+        if in_session_list or explicitly_enabled:
             config_copy = copy.deepcopy(settings)
             config_copy["_session_type"] = "friend"
-            config_copy["_from_session_list"] = True
+            config_copy["_from_session_list"] = in_session_list
             return config_copy
 
         return None

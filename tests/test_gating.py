@@ -97,7 +97,7 @@ class FakeOrchestrator:
         self.plugin = plugin
         self.allowed = allowed
 
-    async def is_chat_allowed(self, session_id):
+    async def is_chat_allowed(self, session_id, trigger=None):
         if not self.allowed:
             return False, "not_private"
         return True, "allowed"

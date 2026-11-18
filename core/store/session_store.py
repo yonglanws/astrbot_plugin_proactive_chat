@@ -6,7 +6,10 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
+import os
+import uuid
 from typing import Any
 
 import aiofiles
@@ -43,18 +46,42 @@ class SessionStore:
         return {}
 
     async def save(self, session_data: dict) -> None:
-        """将会话数据保存到文件。"""
+        """将会话数据原子保存到文件。
+
+        先写入同目录临时文件，再用 ``os.replace`` 原子替换目标文件。
+        这样即使进程在写入过程中崩溃/断电，也不会留下半截 JSON 把
+        全部会话计数、排期与强度状态一起丢掉。
+        """
+        temp_file = self.session_data_file.with_name(
+            f"{self.session_data_file.name}.{uuid.uuid4().hex}.tmp"
+        )
+        snapshot = copy.deepcopy(session_data)
+
+        def _write_atomic() -> None:
+            """同步写临时文件并原子替换；在线程池中执行避免阻塞事件循环。"""
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+            content_to_write = json.dumps(
+                snapshot, indent=4, ensure_ascii=False
+            )
+            with temp_file.open("w", encoding="utf-8") as f:
+                f.write(content_to_write)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except (OSError, AttributeError):
+                    # 某些文件系统不支持 fsync，不影响原子替换语义。
+                    pass
+            os.replace(temp_file, self.session_data_file)
+
         try:
-            await aio_os.makedirs(self.data_dir, exist_ok=True)
-            async with aiofiles.open(
-                self.session_data_file, "w", encoding="utf-8"
-            ) as f:
-                content_to_write = await asyncio.to_thread(
-                    json.dumps, session_data, indent=4, ensure_ascii=False
-                )
-                await f.write(content_to_write)
+            await asyncio.to_thread(_write_atomic)
         except OSError as e:
             logger.error(f"[主动消息] 保存会话数据失败喵: {e}")
+            try:
+                if temp_file.exists():
+                    temp_file.unlink()
+            except OSError:
+                pass
 
     # ------------------------------------------------------------------
     # 合并与规范化（保留旧逻辑以兼容历史数据）
@@ -68,8 +95,44 @@ class SessionStore:
         间隔三元组以 last_scheduled_at 较晚的一方为准。
         """
         merged = base.copy()
+        base_paused_at = (
+            float(base.get("paused_at", 0) or 0)
+            if isinstance(base.get("paused_at"), (int, float))
+            else 0.0
+        )
+        incoming_paused_at = (
+            float(incoming.get("paused_at", 0) or 0)
+            if isinstance(incoming.get("paused_at"), (int, float))
+            else 0.0
+        )
+        base_msg_ts = (
+            float(base.get("last_message_time", 0) or 0)
+            if isinstance(base.get("last_message_time"), (int, float))
+            else 0.0
+        )
+        incoming_msg_ts = (
+            float(incoming.get("last_message_time", 0) or 0)
+            if isinstance(incoming.get("last_message_time"), (int, float))
+            else 0.0
+        )
+        base_scheduled_at = base.get("last_scheduled_at")
+        incoming_scheduled_at = incoming.get("last_scheduled_at")
+        base_sched_ts = (
+            float(base_scheduled_at)
+            if isinstance(base_scheduled_at, (int, float))
+            else 0.0
+        )
+        incoming_sched_ts = (
+            float(incoming_scheduled_at)
+            if isinstance(incoming_scheduled_at, (int, float))
+            else 0.0
+        )
+
         for key in [
             "self_id",
+            "last_sender_id",
+            "last_sender_name",
+            "session_name",
             "last_message_time",
             "unanswered_count",
             "next_trigger_time",
@@ -78,6 +141,7 @@ class SessionStore:
             "last_schedule_max_interval_seconds",
             "last_schedule_random_interval_seconds",
             "last_schedule_intensity_score",
+            "schedule_cancelled",
             "intensity",
             "rhythm",
             "conversation_state",
@@ -113,11 +177,39 @@ class SessionStore:
                     merged[key] = max(merged[key], incoming[key])
                 continue
 
+            if key == "pause_reason":
+                if incoming.get(key) and (
+                    not merged.get(key) or incoming_paused_at >= base_paused_at
+                ):
+                    merged[key] = incoming[key]
+                continue
+
             if key in {"paused_unanswered_count", "paused_threshold"}:
                 if isinstance(merged[key], (int, float)) and isinstance(
                     incoming[key], (int, float)
                 ):
                     merged[key] = max(merged[key], incoming[key])
+                continue
+
+            if key == "schedule_cancelled":
+                if incoming_sched_ts > base_sched_ts and not incoming.get(key):
+                    merged[key] = False
+                elif base_sched_ts > incoming_sched_ts and not merged.get(key):
+                    merged[key] = False
+                else:
+                    merged[key] = bool(merged.get(key) or incoming.get(key))
+                continue
+
+            if key in {"last_sender_id", "last_sender_name"}:
+                if incoming.get(key) and (
+                    not merged.get(key) or incoming_msg_ts >= base_msg_ts
+                ):
+                    merged[key] = incoming[key]
+                continue
+
+            if key == "session_name":
+                if incoming.get(key) and not merged.get(key):
+                    merged[key] = incoming[key]
                 continue
 
             if key == "last_topic_judge":
@@ -281,7 +373,9 @@ class SessionStore:
                 continue
 
             if key == "last_reply_quality":
-                if merged.get(key) in (None, ""):
+                if incoming.get(key) not in (None, "") and (
+                    merged.get(key) in (None, "") or incoming_msg_ts >= base_msg_ts
+                ):
                     merged[key] = incoming[key]
                 continue
 
@@ -292,8 +386,6 @@ class SessionStore:
                 "last_schedule_random_interval_seconds",
                 "last_schedule_intensity_score",
             }:
-                base_scheduled_at = merged.get("last_scheduled_at")
-                incoming_scheduled_at = incoming.get("last_scheduled_at")
                 if isinstance(base_scheduled_at, (int, float)) and isinstance(
                     incoming_scheduled_at, (int, float)
                 ):

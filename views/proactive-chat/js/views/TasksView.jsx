@@ -44,7 +44,7 @@ function TasksView({ onRefresh }) {
     const nowMs = useNow();
     const triggerFeedback = useFeedbackMap(3000);
     const rescheduleFeedback = useFeedbackMap(3000);
-    const displayTimezone = state.config?.displayTimezone || 'Asia/Shanghai';
+    const displayTimezone = window.resolveDisplayTimezone(state.config);
 
     const jobs = state.jobs || [];
     const pausedCount = Number((state.status && state.status.paused_count) || 0);

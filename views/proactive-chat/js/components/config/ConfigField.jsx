@@ -23,7 +23,7 @@
     );
 }
 
-function ConfigField({ fieldKey, schema, value, onChange, depth = 0, path = '', expandedKeys = [], onToggleExpand = () => {} }) {
+function ConfigField({ fieldKey, schema, value, onChange, depth = 0, path = '', expandedKeys = [], onToggleExpand = () => {}, providers = [] }) {
     // hidden 字段完全不渲染，通常用于后端保留字段或不希望前端直接编辑的项。
     if (schema.hidden) return null;
 
@@ -150,6 +150,7 @@ function ConfigField({ fieldKey, schema, value, onChange, depth = 0, path = '', 
                                     path={currentPath}
                                     expandedKeys={expandedKeys}
                                     onToggleExpand={onToggleExpand}
+                                    providers={providers}
                                 />
                             ))}
                         </Box>
@@ -277,6 +278,17 @@ function ConfigField({ fieldKey, schema, value, onChange, depth = 0, path = '', 
                             const num = schema.type === 'integer' || schema.type === 'int' ? parseInt(v, 10) : parseFloat(v);
                             handleChange(isNaN(num) ? 0 : num);
                         }}
+                        onBlur={() => {
+                            // 留空或只输入负号时不要把“看起来空”的状态带进保存；
+                            // 失焦后恢复为当前配置值（或默认值）。
+                            if (localValue === '' || localValue === '-') {
+                                setLocalValue(
+                                    value !== undefined && value !== null
+                                        ? value
+                                        : (schema.default !== undefined ? schema.default : 0)
+                                );
+                            }
+                        }}
                         inputProps={{
                             min: min,
                             max: max,
@@ -332,6 +344,61 @@ function ConfigField({ fieldKey, schema, value, onChange, depth = 0, path = '', 
                         }
                     }}
                 />
+            </Box>
+        );
+    }
+
+    // 动态 Provider 下拉：选项来自 AstrBot 已加载的聊天 Provider，
+    // 用于 topic_judge / planner / critic 等可选专用 Provider 字段。
+    if (schema._special === 'select_provider') {
+        const currentValue = localValue !== undefined ? localValue : (schema.default || '');
+        const providerOptions = Array.isArray(providers) ? providers : [];
+        const knownIds = new Set(providerOptions.map((item) => item.id));
+        const options = [{ id: '', label: '跟随当前会话 Provider' }].concat(providerOptions);
+        // 配置里的 Provider 可能已被删除/未加载，仍保留在当前值中避免静默丢失。
+        if (currentValue && !knownIds.has(currentValue)) {
+            options.push({ id: currentValue, label: `${currentValue}（当前不可用）` });
+        }
+        return (
+            <Box sx={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                py: 1.5,
+                borderBottom: depth === 0 ? 'none' : '1px solid',
+                borderColor: 'divider',
+                '&:last-child': { borderBottom: 'none' }
+            }}>
+                <DescriptionSection schema={schema} fieldKey={fieldKey} flex={5} />
+                <Box sx={{ flex: 3, display: 'flex', justifyContent: 'flex-end', pl: 2 }}>
+                    <TextField
+                        select
+                        fullWidth
+                        size="small"
+                        value={currentValue}
+                        onChange={(e) => handleChange(e.target.value)}
+                        variant="outlined"
+                        SelectProps={{
+                            renderValue: (selected) => {
+                                const matched = options.find((item) => item.id === selected);
+                                return matched ? matched.label : selected;
+                            }
+                        }}
+                        sx={{
+                            '& .MuiOutlinedInput-root': {
+                                borderRadius: 1.5,
+                                bgcolor: 'background.paper',
+                                '&.Mui-focused > fieldset': { borderColor: 'primary.main' }
+                            }
+                        }}
+                    >
+                        {options.map((option) => (
+                            <MenuItem key={option.id || '__default__'} value={option.id}>
+                                {option.label}
+                            </MenuItem>
+                        ))}
+                    </TextField>
+                </Box>
             </Box>
         );
     }

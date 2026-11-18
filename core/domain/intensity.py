@@ -220,8 +220,16 @@ class IntensitySettings:
                 raw.get("apply_to_auto_trigger"), True
             ),
             prompt_context=_as_bool(raw.get("prompt_context"), True),
+            # Schema 使用 0~100 的百分数（默认 20），这里统一解析成 0~1 比例；
+            # 同时兼容旧配置/文档里的 0.2 写法。
             skip_retry_ratio=_clamp(
-                _as_float(raw.get("skip_retry_ratio"), 0.2), 0.0, 1.0
+                _as_ratio(
+                    raw.get("skip_retry_ratio"),
+                    0.2,
+                    integer_is_percent=True,
+                ),
+                0.0,
+                1.0,
             ),
             min_skip_retry_minutes=max(
                 1, _as_int(raw.get("min_skip_retry_minutes"), 5)

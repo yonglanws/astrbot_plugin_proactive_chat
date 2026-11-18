@@ -116,6 +116,38 @@ class SessionService:
             log_str += f" ({session_name})"
         return log_str
 
+    def _is_explicitly_configured_platform(
+        self, platform: str, target_id: str, msg_type: str
+    ) -> bool:
+        """判断平台标识是否在配置、持久化状态或会话覆写中明确出现。"""
+        plugin = self.plugin
+        candidate_umo = f"{platform}:{msg_type}:{target_id}"
+
+        config_service = getattr(plugin, "config_service", None)
+        if config_service is not None:
+            try:
+                private_settings = config_service.get_private_settings() or {}
+                session_list = private_settings.get("session_list") or []
+                for entry in session_list:
+                    if isinstance(entry, str) and entry.startswith(f"{platform}:"):
+                        return True
+            except Exception:
+                pass
+
+        session_data = getattr(plugin, "session_data", None)
+        if isinstance(session_data, dict) and candidate_umo in session_data:
+            return True
+
+        override_mgr = getattr(plugin, "session_override_manager", None)
+        if override_mgr is not None:
+            try:
+                if candidate_umo in override_mgr.list_sessions():
+                    return True
+            except Exception:
+                pass
+
+        return False
+
     def resolve_full_umo(
         self, target_id: str, msg_type: str, preferred_platform: str | None = None
     ) -> str:
@@ -123,26 +155,25 @@ class SessionService:
         plugin = self.plugin
         type_keyword = "Friend" if is_friend_type(msg_type) else "Group"
 
-        active_insts = {
-            p.meta().id: p
-            for p in iter_active_platform_instances(plugin.context.platform_manager)
-        }
+        platform_manager = getattr(getattr(plugin, "context", None), "platform_manager", None)
+        active_insts = (
+            {
+                p.meta().id: p
+                for p in iter_active_platform_instances(platform_manager)
+            }
+            if platform_manager is not None
+            else {}
+        )
 
-        if (
-            preferred_platform
-            and preferred_platform in active_insts
-            and active_insts[preferred_platform].status == PlatformStatus.RUNNING
-        ):
-            return f"{preferred_platform}:{msg_type}:{target_id}"
+        # 只要目标平台实例仍然存在（即便暂时断开/重连），或已在配置/状态中
+        # 明确指定，就保留原平台前缀，避免瞬时断连把 UMO 漂移到其他平台导致计数清零。
+        if preferred_platform:
+            if preferred_platform in active_insts or self._is_explicitly_configured_platform(
+                preferred_platform, target_id, msg_type
+            ):
+                return f"{preferred_platform}:{msg_type}:{target_id}"
 
-        if (
-            preferred_platform
-            and preferred_platform in active_insts
-            and active_insts[preferred_platform].status == PlatformStatus.PENDING
-        ):
-            return f"{preferred_platform}:{msg_type}:{target_id}"
-
-        for existing_id in plugin.session_data.keys():
+        for existing_id in getattr(plugin, "session_data", {}).keys():
             if type_keyword in existing_id and existing_id.endswith(f":{target_id}"):
                 p_id = existing_id.split(":")[0]
                 if (

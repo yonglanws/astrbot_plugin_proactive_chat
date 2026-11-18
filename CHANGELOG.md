@@ -5,6 +5,39 @@
 
 ---
 
+## v2.5.0 — 未回复暂停闭环、拟人化去 AI 味升级与控制台稳定性修复
+
+### 修复
+
+- **连续未回复暂停与调度闭环**：
+  - 第 N 次主动消息发送完成后在 `FlowOrchestrator.finalize_and_reschedule` 内立即检查 `new_unanswered_count >= max_unanswered_times` 并触发 `pause_session()`，不再额外多排期一轮；
+  - `GatingStage`、`SchedulerService.init_jobs_from_data`、`handle_auto_trigger_callback` 与 WebUI `reschedule_job` / `trigger_job` 统一执行 `int` 强转校验并拦截已暂停或已达上限的会话；
+  - 修复 `on_friend_message` 与并发暂停之间的竞态、`schedule_next_chat_and_save` 锁外检查暂停标记、`resolve_full_umo` 在已配置平台短暂断开时发生键漂移重置计数的问题；
+  - 修复 WebUI 手动取消调度任务在插件重启后被重新排期复活的问题（新增 `SchedulerService.cancel_session_schedule` 与 `schedule_cancelled` 标记）；
+  - `pause_settings.resume_mode=llm_topic` 下收到纯图片/表情包等非文本消息时保持暂停（保留 `fallback_resume_on_error=true`）；
+  - 未启用会话不再向 `session_data` 与 `last_message_times` 写入垃圾状态；`SessionControlService.disable` 改为清理同目标全部关联任务。
+- **并发安全、生命周期与存储健壮性**：
+  - `ContextStage`、`GuardStage`、`CriticStage`、`GatingStage` 全面纳入 `plugin.data_lock` 保护，且 `ContextStage` 不再覆盖规范化的 `ctx.session_id`；
+  - `SessionStore.save()` 改为深拷贝后写唯一临时文件再原子替换；`OverrideStore` 对会话键统一规范化；`SessionStore.merge_session_info` 补全字段并按时间戳合并暂停/质量字段；
+  - 修复 `LifecycleService` 在平台等待超时路径上的重复启动初始化、重启丢失最近消息时间戳、以及未开启遥测时遗漏清理已登记业务后台任务的问题；
+  - 修复 `FlowOrchestrator.run()` 手动触发互斥释放竞争与 `_on_abort` 对禁用/暂停会话的误重排；
+  - 修复 `astrbot_conversation.add_assistant_message` 并发读写覆盖与 JSON 解析异常、`content_text` 空文本段拼接、`context_service` 自定义标识符丢失 `"bot"`、`llm_service` 空 `MessageChain` 误判与占位符二次替换问题。
+- **Web 控制台与遥测**：
+  - `ApiRoutes.login` 将输入密码与配置密码统一编码为 UTF-8 字节后执行 `secrets.compare_digest`，修复中文/非 ASCII 或数字密码返回 500；
+  - `StateBuilder` 修正 `max_unanswered_times` 默认展示为 `4`、修正自动触发计时器卡片的 `started_at` 计算并安全快照读取 `session_data`；
+  - 配置/会话覆写保存后主动失效流水线缓存（`invalidate_runner()`）并同步刷新定时/自动触发器；统一 `trigger_job` 任务追踪；
+  - `TokenAuth` 增加 256 令牌容量淘汰与 `stop_cleanup()` 任务等待；
+  - `TelemetryManager` 在请求超时时按上限入队重试，并在 `close()` 时即使未延迟创建过 HTTP 会话也会按需创建会话刷出剩余积压事件。
+
+### 优化（拟人化与去 AI 味）
+
+- **上下文优先的意图选择**：将 `CONTEXT` 提前至 `INTENT` 之前，使关系状态机能够感知最新对话与告别信号（如“晚安/先睡了”）；`Intent.SILENT` 采用更自然的退避间隔，避免短周期反复重试。
+- **去模板化提示词与语境注入**：重写内置 `proactive_prompt` 与 `platform_history_prompt`，移除生硬的任务框架与“未回复即委屈想念”的提示；在历史消息间注入相对时间标记并使用人格名称替代字面 `Bot:`；将内部评分与比例转换为自然行为引导而不泄露原始数值；将系统级动态引导置于末尾以利缓存复用；`PlannerService` / `CriticService` 接入人格摘要。
+- **更精准的启发式与多阶段守卫**：修复 `PersonaStateService.refresh` 每次读取重复扣减精力导致的能量坍塌并支持 `read_only=True`；收紧负反馈、敷衍与提问正则；`GuardService` 按真实连续提问数判定并拦截套路化开场，且确保 `Guard` 在 `Critic` 改写后复检同步更新 `result_chain`；过期 `plan`/`event` 开放话题按时间自然到期或转化提示。
+- **自然气泡节奏与精确送达存档**：允许中等消息按换行/句界自然拆分为气泡、口语化省略短气泡末尾句号、按即将发送的气泡字数计算打字延迟并尊重总延迟上限；过滤链接、代码块、纯表情及过长文本的随机语音；仅对实际送达文本（`DeliveryReport`）写入对话历史与记忆。
+
+---
+
 ## v2.4.0 — AstrBot 原生插件页面
 
 ### 新增

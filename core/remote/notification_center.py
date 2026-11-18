@@ -353,30 +353,33 @@ class NotificationCenter:
             logger.info("[主动消息] 通知系统未启用或配置不完整喵。")
             return
 
-        changed = await self.refresh()
-        if getattr(self.plugin, "web_admin_server", None):
-            if changed:
-                await self.plugin.web_admin_server._broadcast_update("notifications")
-            else:
-                await self.plugin.web_admin_server._broadcast_notification_meta_update(
-                    "notifications-meta"
-                )
+        async def _refresh_and_broadcast() -> None:
+            changed = await self.refresh()
+            if getattr(self.plugin, "web_admin_server", None):
+                if changed:
+                    await self.plugin.web_admin_server._broadcast_update(
+                        "notifications"
+                    )
+                else:
+                    await self.plugin.web_admin_server._broadcast_notification_meta_update(
+                        "notifications-meta"
+                    )
 
         async def _poll_loop() -> None:
+            # 首次远端同步放到后台任务里执行：通知服务不可达时最多阻塞
+            # 一个 HTTP 超时，但不再拖慢插件 initialize()。
+            try:
+                await _refresh_and_broadcast()
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                logger.warning(f"[主动消息] 首次同步远端通知失败喵: {e} (可忽略)")
+
             # 周期性同步远端通知，并按变更情况广播给 Web 端。
             while True:
                 try:
                     await asyncio.sleep(self._get_poll_interval_seconds())
-                    changed = await self.refresh()
-                    if getattr(self.plugin, "web_admin_server", None):
-                        if changed:
-                            await self.plugin.web_admin_server._broadcast_update(
-                                "notifications"
-                            )
-                        else:
-                            await self.plugin.web_admin_server._broadcast_notification_meta_update(
-                                "notifications-meta"
-                            )
+                    await _refresh_and_broadcast()
                 except asyncio.CancelledError:
                     break
                 except Exception as e:

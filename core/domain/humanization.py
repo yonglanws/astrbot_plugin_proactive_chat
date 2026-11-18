@@ -415,14 +415,36 @@ REPLY_QUALITY_LABELS = {
     ReplyQuality.MEDIA: "媒体消息",
 }
 
-_NEGATIVE_RE = re.compile(
+_NEGATIVE_STRONG_RE = re.compile(
     r"(别发了?|不要发了?|不要再发|别再发|别找我|别烦|烦不烦|不想聊|"
-    r"没空|在忙|不要打扰|别打扰|闭嘴|滚开|滚|拉黑|举报|"
+    r"不要打扰|别打扰|闭嘴|滚开|滚蛋|滚出去|拉黑|举报|"
     r"shut\s*up|leave\s+me\s+alone|do\s+not\s+message|don'?t\s+message|"
     r"stop\s+messaging|i'?m\s+busy)",
     re.IGNORECASE,
 )
-_QUESTION_RE = re.compile(r"[?？]|吗|呢|怎么|为什么|什么|哪儿|哪|如何|是否")
+_NEGATIVE_BUSY_RE = re.compile(
+    r"(?:我现在|我正|正|现在|今天|最近|这会儿|有点)?(?:在忙|没空)"
+    r"(?:$|[\s，,。.!！~～]|.*(?:别|不要|晚点|回头|改天|再聊|不聊))",
+    re.IGNORECASE,
+)
+_NEGATIVE_BUSY_NEGATION_RE = re.compile(
+    r"(之前|以前|刚才|刚|本来|原本|一直|昨天|前几天|终于|已经).*(?:不忙|有空|闲|好)"
+    r"|不忙|有空了",
+    re.IGNORECASE,
+)
+_NEGATIVE_SOLO_GUN_RE = re.compile(r"^(?:给我)?滚[啊呀吧!！。.~～\s]*$")
+_QUESTION_INTERROGATIVE_RE = re.compile(
+    r"(?:^|[，,。！!\n\s])[^，。！？\n]{0,24}?"
+    r"(?:吗|怎么样|怎么办|真的假的|真的吗)(?=$|[\s，,。.!！~～])"
+    r"|(?:^|[，,。！!\n\s])(?:那|你|它|他|她|这)呢(?=$|[\s，,。.!！~～])"
+    r"|(?:^|[，,。！!\n\s])(?:为什么|为啥|什么时候|啥时候|几点|多久|多远|多少|"
+    r"哪个|哪儿|哪里|干嘛|干啥|是不是|能不能|要不要|好不好|行不行|"
+    r"有没有|会不会|对不对|怎么(?:样|办|突然|不|没|了))"
+    r"|(?:^|[，,。！!\n\s])[^，。！？\n]{0,10}([\u4e00-\u9fff])[不没]\1(?=$|[\s，,。.!！~～])"
+)
+_QUESTION_NON_INTERROGATIVE_RE = re.compile(
+    r"(?:不知道|不清楚|没想好|不管|无论|随便)(?:为什么|为啥|怎么|哪个|哪儿|哪里|多少|什么时候)"
+)
 _EMOJI_ONLY_RE = re.compile(
     r"^[\s\U0001F300-\U0001FAFF\U00002600-\U000027BF"
     r"\U0001F000-\U0001F0FF\U00002190-\U000021FF"
@@ -431,26 +453,53 @@ _EMOJI_ONLY_RE = re.compile(
 _PERFUNCTORY_TOKENS = {
     "嗯",
     "嗯嗯",
+    "嗯哼",
     "哦",
     "哦哦",
+    "哦豁",
     "啊",
+    "啊这",
     "哈",
     "哈哈",
     "额",
     "呃",
+    "唔",
     "噢",
     "好",
     "好的",
+    "好吧",
+    "好滴",
+    "好哒",
     "行",
+    "行吧",
     "可以",
     "收到",
+    "收到啦",
     "ok",
     "okay",
+    "okok",
+    "ok啦",
     "k",
+    "6",
+    "666",
+    "88",
+    "1",
     "。",
     "...",
     "……",
 }
+
+
+def _is_negative_feedback(text: str) -> bool:
+    if _NEGATIVE_STRONG_RE.search(text):
+        return True
+    if _NEGATIVE_SOLO_GUN_RE.match(text):
+        return True
+    if _NEGATIVE_BUSY_RE.search(text) and not _NEGATIVE_BUSY_NEGATION_RE.search(text):
+        compact = re.sub(r"\s+", "", text)
+        if len(compact) <= 18 or re.search(r"(别|不要|晚点|回头|改天|再聊|不聊)", text):
+            return True
+    return False
 
 
 def classify_reply(
@@ -464,26 +513,28 @@ def classify_reply(
     if not normalized:
         return ReplyQuality.MEDIA if has_media else ReplyQuality.PERFUNCTORY
 
-    if _NEGATIVE_RE.search(normalized):
+    if _is_negative_feedback(normalized):
         return ReplyQuality.NEGATIVE
     if has_media:
         return ReplyQuality.MEDIA
 
     compact = re.sub(r"\s+", "", normalized).lower()
+    compact_no_tail = re.sub(r"[!！。.~～]+$", "", compact) or compact
     if (
         len(compact) <= 1
         or compact in _PERFUNCTORY_TOKENS
+        or compact_no_tail in _PERFUNCTORY_TOKENS
         or _EMOJI_ONLY_RE.match(normalized)
     ):
         return ReplyQuality.PERFUNCTORY
 
-    if _QUESTION_RE.search(normalized):
+    if has_question(normalized):
         return ReplyQuality.QUESTION
 
     # 短回复不必然敷衍：“到了”“晚安”“在路上了”都是有效回应；
     # 只有整句都由语气词构成时才归为敷衍。
     if len(compact) <= max(1, min_substantive_length) and all(
-        char in "嗯哦啊哈额呃噢好吧行可以收到没在" for char in compact
+        char in "嗯哦啊哈额呃噢唔好吧行可以收到没在滴哒" for char in compact_no_tail
     ):
         return ReplyQuality.PERFUNCTORY
     return ReplyQuality.SUBSTANTIVE
@@ -586,7 +637,14 @@ def text_similarity(left: str, right: str) -> float:
 
 
 def has_question(text: str) -> bool:
-    return bool(re.search(r"[?？]|吗|呢|怎么|为什么|什么|哪儿|哪|如何", text or ""))
+    content = str(text or "").strip()
+    if not content:
+        return False
+    if "?" in content or "？" in content:
+        return True
+    if _QUESTION_NON_INTERROGATIVE_RE.search(content) and "吗" not in content:
+        return False
+    return bool(_QUESTION_INTERROGATIVE_RE.search(content))
 
 
 # ---------------------------------------------------------------------------
@@ -626,6 +684,31 @@ class DeliveryPlan:
 def _split_sentences(text: str) -> list[str]:
     parts = re.split(r"(?<=[。！？!?…~])\s*|\n+", str(text or ""))
     return [part.strip() for part in parts if part and part.strip()]
+
+
+def _strip_casual_period(bubble_text: str) -> str:
+    """短小单句气泡去掉末尾生硬句号，保留问号/感叹号/波浪号/省略号。"""
+    text = str(bubble_text or "").strip()
+    if (
+        len(text) <= 22
+        and text.endswith("。")
+        and not text.endswith("。。")
+        and text.count("。") == 1
+    ):
+        return text[:-1].rstrip()
+    return text
+
+
+def _is_voice_suitable(text: str) -> bool:
+    """过滤不适合转成语音的文本（链接、代码块、纯表情、过长文本）。"""
+    content = str(text or "").strip()
+    if not content or len(content) > 140:
+        return False
+    if "http://" in content or "https://" in content or "```" in content:
+        return False
+    if _EMOJI_ONLY_RE.match(content):
+        return False
+    return True
 
 
 def _group_sentences(sentences: list[str], max_bubbles: int) -> list[str]:
@@ -684,11 +767,16 @@ def build_delivery_plan(
     if not normalized:
         return DeliveryPlan(reason="empty")
 
-    if len(normalized) <= settings.bubble_length_threshold or settings.max_bubbles <= 1:
+    explicit_lines = [line.strip() for line in normalized.splitlines() if line.strip()]
+    if settings.max_bubbles > 1 and len(explicit_lines) >= 2 and len(normalized) <= settings.bubble_length_threshold:
+        groups = _group_sentences(explicit_lines, settings.max_bubbles)
+    elif len(normalized) <= settings.bubble_length_threshold or settings.max_bubbles <= 1:
         groups = [normalized]
     else:
         sentences = _split_sentences(normalized)
         groups = _group_sentences(sentences, settings.max_bubbles) or [normalized]
+
+    groups = [_strip_casual_period(g) or g for g in groups]
 
     first_delay = generator.uniform(
         min(settings.first_delay_min_seconds, settings.first_delay_max_seconds),
@@ -700,7 +788,8 @@ def build_delivery_plan(
         if index == 0:
             delay = first_delay
         else:
-            previous_length = len(groups[index - 1])
+            # 按即将发送气泡的字数模拟打字耗时，而不是上一条气泡的长度。
+            upcoming_length = len(group)
             base = generator.uniform(
                 min(
                     settings.inter_bubble_min_seconds,
@@ -711,7 +800,7 @@ def build_delivery_plan(
                     settings.inter_bubble_max_seconds,
                 ),
             )
-            delay = base + min(1.5, previous_length * 0.01)
+            delay = base + min(3.5, upcoming_length * 0.08)
         if total_delay + delay > settings.max_total_delay_seconds:
             delay = max(0.0, settings.max_total_delay_seconds - total_delay)
         total_delay += delay
@@ -720,6 +809,7 @@ def build_delivery_plan(
     return DeliveryPlan(
         bubbles=bubbles,
         voice=bool(voice_allowed)
+        and _is_voice_suitable(normalized)
         and generator.random() < settings.voice_probability,
         ask_question=has_question(normalized),
         reason="planned",

@@ -64,7 +64,7 @@ function NotificationsView({ onRefresh }) {
     // 兜底保证渲染层始终拿到数组，避免 map 时出现空值异常。
     const notifications = Array.isArray(state.notifications) ? state.notifications : [];
     const notificationsMeta = state.notificationsMeta || { unread_count: 0, last_sync_at: '', total_count: 0 };
-    const displayTimezone = state.config?.displayTimezone || 'Asia/Shanghai';
+    const displayTimezone = window.resolveDisplayTimezone(state.config);
     // busyAction 用单字符串标记当前进行中的动作，便于按钮粒度控制禁用状态。
     const [busyAction, setBusyAction] = React.useState('');
 
