@@ -151,6 +151,23 @@
           }
         }
       },
+      "data_retention_settings": {
+        "description": "🗂️ 会话数据保留（清理长期未活跃的未启用会话）",
+        "type": "object",
+        "items": {
+          "stale_session_days": {
+            "description": "未启用会话的保留天数",
+            "type": "int",
+            "default": 30,
+            "slider": {
+              "min": 0,
+              "max": 365,
+              "step": 1
+            },
+            "hint": "只清理“未启用且最后活动时间早于该天数”的会话数据；启用中的会话与近期仍有事件的会话永不清理。填 0 表示不清理，默认 30 天。"
+          }
+        }
+      },
       "tts_settings": {
         "description": "🔊 私聊语音合成 (TTS) 设置",
         "type": "object",

@@ -537,9 +537,15 @@ class ApiRoutes:
         # 互动强度面板：按分数从高到低返回所有私聊会话。
         @app.get("/api/intensity")
         async def list_intensity():
-            sessions = state.collect_intensity_sessions()
-            summary = state.build_intensity_summary()
-            return {"sessions": sessions, "summary": summary}
+            # 单次遍历同时产出 sessions 与 summary（带 15s TTL），
+            # 并放到线程池执行，避免整批会话评估阻塞事件循环。
+            payload_builder = getattr(state, "collect_intensity_payload", None)
+            if callable(payload_builder):
+                return await asyncio.to_thread(payload_builder)
+            return {
+                "sessions": state.collect_intensity_sessions(),
+                "summary": state.build_intensity_summary(),
+            }
 
         # 手动重新调度下一次主动消息（不重置未回复计数）。
         @app.post("/api/jobs/{umo:path}/reschedule")

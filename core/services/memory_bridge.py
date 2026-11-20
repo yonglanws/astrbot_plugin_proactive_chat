@@ -341,6 +341,35 @@ class MemoryBridge:
     # ------------------------------------------------------------------
     # 写回
     # ------------------------------------------------------------------
+    async def last_message_is(self, session_id: str, text: str) -> bool:
+        """判断会话库末尾是否已经是这段助手文本。
+
+        主动消息会显式派发 on_llm_response，记忆插件通常已按原文落库；
+        收尾阶段用本方法确认后再决定是否需要兜底写入，避免同一句话写两次。
+        """
+        content = str(text or "").strip()
+        if not content:
+            return False
+        settings = self.get_settings()
+        if not settings.enabled:
+            return False
+        star = await self.resolve_plugin()
+        manager = self._conversation_manager(star)
+        if manager is None:
+            return False
+        try:
+            last = await asyncio.wait_for(
+                manager.get_last_message(session_id),
+                timeout=settings.timeout_seconds,
+            )
+        except Exception:
+            return False
+        return (
+            last is not None
+            and getattr(last, "role", "") == "assistant"
+            and str(getattr(last, "content", "") or "").strip() == content
+        )
+
     async def store_proactive(
         self,
         session_id: str,
@@ -348,8 +377,14 @@ class MemoryBridge:
         *,
         session_config: Mapping[str, Any] | None = None,
         now: float | None = None,
+        dedup_text: str | None = None,
     ) -> bool:
-        """把已发送的主动消息写入外部记忆插件的会话库。"""
+        """把已发送的主动消息写入外部记忆插件的会话库。
+
+        ``dedup_text`` 用于和会话库末尾的助手消息做去重比较：调用方应传入
+        LLM 原始 completion_text（而不是分段/气泡拼接后的文本），这样
+        即使落库文本被改写，也能识别出同一句话已经由 on_llm_response 写入。
+        """
         settings = self.get_settings(session_config)
         if not settings.enabled or not settings.write_proactive:
             return False
@@ -363,12 +398,17 @@ class MemoryBridge:
             return False
 
         # 避免同一句话因为重试/重复收尾被写两次。
+        dedup_candidates = {content}
+        dedup_content = str(dedup_text or "").strip()
+        if dedup_content:
+            dedup_candidates.add(dedup_content)
         try:
             last = await manager.get_last_message(session_id)
             if (
                 last is not None
                 and getattr(last, "role", "") == "assistant"
-                and str(getattr(last, "content", "") or "").strip() == content
+                and str(getattr(last, "content", "") or "").strip()
+                in dedup_candidates
             ):
                 return False
         except Exception:

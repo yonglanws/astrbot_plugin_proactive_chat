@@ -959,6 +959,11 @@ class IntensityService:
     ) -> dict[str, Any]:
         """管理端顶部指标：平均分、各等级人数、平均概率。"""
         snapshots = self.collect_snapshots(session_ids, read_only=read_only)
+        return self.summary_from_snapshots(snapshots)
+
+    @staticmethod
+    def summary_from_snapshots(snapshots: list[dict[str, Any]]) -> dict[str, Any]:
+        """用一次快照结果同时产出面板汇总，避免重复评估同一批会话。"""
         active = [item for item in snapshots if item.get("has_state")]
         tiers: dict[str, int] = {}
         for item in snapshots:

@@ -323,6 +323,9 @@ class FlowOrchestrator:
         unanswered_count: int,
         intent: str | None = None,
         started_at: float | None = None,
+        *,
+        llm_response_dispatched: bool = False,
+        llm_original_text: str | None = None,
     ) -> None:
         """主动消息任务完成后的收尾工作。
 
@@ -516,18 +519,40 @@ class FlowOrchestrator:
         if skipped_by_user_reply:
             return
 
-        # 主动消息不会经过 AstrBot 的 on_llm_response 钩子，因此需要显式
-        # 写回外部长期记忆插件的会话库，保证后续召回能看到这句话。
+        # 主动消息的 on_llm_response 已在 DELIVER 阶段显式派发：记忆插件
+        # 会按 completion_text 原文落库。这里先确认末尾是否已经是这段原文，
+        # 已写入就不再重复写；确实未写入时才用原文兜底（而不是使用改写后的
+        # 气泡拼接文本），保证一条消息只走一条写入路径。
         memory_bridge = getattr(plugin, "memory_bridge", None)
         if memory_bridge is not None and (assistant_response or "").strip():
-            try:
-                await memory_bridge.store_proactive(
-                    normalized_session_id,
-                    assistant_response,
-                    session_config=session_config,
+            original_text = str(llm_original_text or "").strip()
+            memory_text = original_text or assistant_response
+            already_written = False
+            if llm_response_dispatched and original_text:
+                checker = getattr(memory_bridge, "last_message_is", None)
+                if callable(checker):
+                    try:
+                        already_written = await checker(
+                            normalized_session_id, original_text
+                        )
+                    except Exception as e:
+                        logger.debug(
+                            f"[主动消息] 确认长期记忆写入状态失败喵: {e}"
+                        )
+                        already_written = False
+            if already_written:
+                logger.debug(
+                    "[主动消息] on_llm_response 已写入长期记忆，跳过重复写入喵。"
                 )
-            except Exception as e:
-                logger.debug(f"[主动消息] 写回长期记忆失败喵: {e}")
+            else:
+                try:
+                    await memory_bridge.store_proactive(
+                        normalized_session_id,
+                        memory_text,
+                        session_config=session_config,
+                    )
+                except Exception as e:
+                    logger.debug(f"[主动消息] 写回长期记忆失败喵: {e}")
 
         if paused_or_capped or scheduled_job_payload is None:
             return

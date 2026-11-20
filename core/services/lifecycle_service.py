@@ -425,7 +425,9 @@ class LifecycleService:
             if plugin.data_lock:
                 try:
                     async with plugin.data_lock:
-                        await plugin.storage_service.save_data()
+                        # 卸载/重载前必须跳过防抖立即落盘，否则内存中的
+                        # 最新会话状态会随插件实例一起丢失。
+                        await plugin.storage_service.save_data(immediate=True)
                     logger.info("[主动消息] 会话数据已保存喵。")
                 except Exception as e:
                     logger.error(f"[主动消息] 保存数据时出错喵: {e}")

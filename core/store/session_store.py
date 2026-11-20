@@ -45,8 +45,8 @@ class SessionStore:
                 return {}
         return {}
 
-    async def save(self, session_data: dict) -> None:
-        """将会话数据原子保存到文件。
+    async def save(self, session_data: dict) -> bool:
+        """将会话数据原子保存到文件，返回是否成功。
 
         先写入同目录临时文件，再用 ``os.replace`` 原子替换目标文件。
         这样即使进程在写入过程中崩溃/断电，也不会留下半截 JSON 把
@@ -55,6 +55,8 @@ class SessionStore:
         temp_file = self.session_data_file.with_name(
             f"{self.session_data_file.name}.{uuid.uuid4().hex}.tmp"
         )
+        # 快照在事件循环线程内同步完成：deepcopy 期间没有 await，
+        # 不会被其他协程的写入打断；序列化与磁盘写入放到线程池。
         snapshot = copy.deepcopy(session_data)
 
         def _write_atomic() -> None:
@@ -75,6 +77,7 @@ class SessionStore:
 
         try:
             await asyncio.to_thread(_write_atomic)
+            return True
         except OSError as e:
             logger.error(f"[主动消息] 保存会话数据失败喵: {e}")
             try:
@@ -82,6 +85,7 @@ class SessionStore:
                     temp_file.unlink()
             except OSError:
                 pass
+            return False
 
     # ------------------------------------------------------------------
     # 合并与规范化（保留旧逻辑以兼容历史数据）

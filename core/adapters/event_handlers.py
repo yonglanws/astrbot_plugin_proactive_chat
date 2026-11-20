@@ -197,11 +197,20 @@ class EventHandlers:
         # 也不触发话题判定 LLM。
         #
         # AstrBot 在私聊里会先剥掉 wake_prefix，所以不能只判断消息是否以
-        # “/”开头；waking_check 命中任意 CommandFilter 后会写入
-        # parsed_params，用它判断最可靠。
+        # “/”开头。4.30 的 waking_check 会在匹配完 handler 后把
+        # parsed_params pop 掉，只在 handler 内保留；它同时把每个命中
+        # 指令的 handler 汇总成 handlers_parsed_params 写回事件。
+        # 因此这里优先读 handlers_parsed_params（覆盖“已注册指令但无前缀”
+        # 的私聊场景），parsed_params 仅作为旧版本兜底。
         missing = object()
         try:
             if event.get_extra("parsed_params", missing) is not missing:
+                logger.debug("[主动消息] 忽略命令消息喵。")
+                return
+            handlers_parsed_params = event.get_extra(
+                "handlers_parsed_params", None
+            )
+            if isinstance(handlers_parsed_params, dict) and handlers_parsed_params:
                 logger.debug("[主动消息] 忽略命令消息喵。")
                 return
         except Exception:
@@ -514,6 +523,9 @@ class EventHandlers:
             )
 
         if keep_paused:
+            # 统一走 StorageService 的串行合并写：这里只登记脏数据并由
+            # 版本号决定最终落盘内容，避免锁外立即保存的旧快照覆盖
+            # 随后在锁内更新的新状态。
             await self.plugin.storage_service.save_data()
             logger.info(
                 f"[主动消息] {self.plugin.session_service.get_session_log_str(normalized_session_id, session_config)} "

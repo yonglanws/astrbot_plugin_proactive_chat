@@ -41,6 +41,11 @@ class DeliveryPlanStage(BaseStage):
             raw_chain_before = list(
                 getattr(getattr(llm_response, "result_chain", None), "chain", []) or []
             )
+            # 记录钩子派发前（守卫/Critic 改写后）的原文：LivingMemory 的
+            # on_llm_response 会按这份文本落库，后续兜底写入要用它去重。
+            hook_original_text = str(
+                getattr(llm_response, "completion_text", "") or ""
+            )
             try:
                 stopped = await plugin.llm_service.dispatch_llm_response_hooks(
                     ctx.event, llm_response
@@ -48,6 +53,10 @@ class DeliveryPlanStage(BaseStage):
             except Exception as e:
                 logger.error(f"[主动消息] 派发 LLM 后置钩子失败喵: {e}")
                 stopped = False
+            # 标记本轮已派发 on_llm_response：记忆插件已按原文写入，
+            # 收尾阶段不应再用气泡拼接文本调用 store_proactive 写第二次。
+            extra["llm_response_hooks_dispatched"] = True
+            extra["llm_response_original_text"] = hook_original_text
             if stopped:
                 logger.info(
                     "[主动消息] LLM 后置钩子终止了事件传播，放弃本次生成结果喵。"

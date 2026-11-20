@@ -262,6 +262,15 @@ class SenderService:
         if event is None or EventType is None:
             return components, True
 
+        # 契约 C1：主动消息是用伪事件派发的，必须显式打标。
+        # splitter 等 on_decorating_result 钩子据此直接 return，不再把
+        # 主动消息当入站消息接管（否则会构造指向伪造 message_id 的 Reply、
+        # 清空 result.chain，主动侧只能看到最后一段或判定发送失败）。
+        try:
+            event.set_extra("_proactive_dispatch", True)
+        except Exception:  # pragma: no cover - 未知事件实现
+            pass
+
         result = MessageEventResult()
         result.set_result_content_type(ResultContentType.LLM_RESULT)
         result.chain = list(components)

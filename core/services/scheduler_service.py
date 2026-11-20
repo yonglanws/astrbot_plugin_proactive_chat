@@ -744,8 +744,15 @@ class SchedulerService:
 
         async with plugin.data_lock:
             cleaned_count = self.plugin.storage_service.cleanup_invalid_session_data()
-            if cleaned_count > 0:
-                logger.info(f"[主动消息] 清理了 {cleaned_count} 个无效的会话数据条目喵。")
+            prune_fn = getattr(
+                self.plugin.storage_service, "prune_stale_session_data", None
+            )
+            pruned_count = prune_fn() if callable(prune_fn) else 0
+            if cleaned_count > 0 or pruned_count > 0:
+                logger.info(
+                    f"[主动消息] 清理了 {cleaned_count} 个无效、"
+                    f"{pruned_count} 个长期未活跃的会话数据条目喵。"
+                )
                 await plugin.storage_service.save_data()
             session_entries = [
                 (sid, dict(info) if isinstance(info, dict) else {})
@@ -882,10 +889,12 @@ class SchedulerService:
         reset_counter: bool = False,
         forced_interval_seconds: int | float | None = None,
     ) -> None:
-        """安排下一次主动聊天并立即将状态持久化。
+        """安排下一次主动聊天并持久化状态。
 
         全过程在 data_lock 内完成：迁移会话键 -> 重置计数(可选) ->
-        计算触发时间（含互动强度修正） -> 注册任务 -> 写入调度字段 -> 落盘。
+        计算触发时间（含互动强度修正） -> 注册任务 -> 写入调度字段。
+        落盘交给 StorageService 的防抖合并写，避免在全局锁内重复
+        deepcopy + 写入整份 session_data.json。
         """
         plugin = self.plugin
         if getattr(plugin, "_terminating", False):

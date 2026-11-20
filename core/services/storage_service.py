@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
+import weakref
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +18,17 @@ from astrbot.api import logger
 from ..store.session_store import SessionStore
 
 INTENSITY_SEED_FILE = "intensity_seed.json"
+# 会话数据防抖窗口：窗口内的多次变更只落盘一次。
+DEFAULT_SAVE_DEBOUNCE_SECONDS = 1.5
+# 未启用且长期无活动的会话默认保留天数（0 表示不清理）。
+DEFAULT_STALE_SESSION_DAYS = 30
+
+# 同一数据目录下仍有待写数据的 StorageService。
+# 热重载会在同一进程内创建新实例；加载前必须先把旧实例的脏数据落盘，
+# 否则新实例会读到落后于内存状态的旧文件。弱引用避免实例被卸载后滞留。
+_PENDING_SAVES: "weakref.WeakValueDictionary[str, StorageService]" = (
+    weakref.WeakValueDictionary()
+)
 
 
 class StorageService:
@@ -27,11 +40,39 @@ class StorageService:
         # 复用容器中已存在的文件路径，保持完全一致的落盘位置。
         if getattr(plugin, "session_data_file", None):
             self._store.session_data_file = plugin.session_data_file
+        # 合并写状态：版本号只增不减，落盘前比较版本可丢弃过期快照。
+        self._save_version = 0
+        self._saved_version = 0
+        self._save_task: asyncio.Task | None = None
+        self._save_lock: asyncio.Lock | None = None
+        self._save_lock_loop: asyncio.AbstractEventLoop | None = None
+
+    @property
+    def _save_key(self) -> str:
+        """按会话数据文件的绝对路径区分不同插件实例的数据。"""
+        try:
+            return str(Path(self._store.session_data_file).resolve())
+        except Exception:
+            return str(self._store.session_data_file)
 
     async def load_data(self) -> None:
         """从文件中加载会话数据，并合并独立的强度种子。"""
+        await self._flush_pending_for_same_file()
         self.plugin.session_data = await self._store.load()
+        # 重新加载后内存状态与文件一致，版本号归零。
+        self._save_version = 0
+        self._saved_version = 0
         await self._merge_intensity_seed()
+
+    async def _flush_pending_for_same_file(self) -> None:
+        """加载前先落盘同路径旧实例的待写数据，避免热重载读到旧快照。"""
+        pending = _PENDING_SAVES.get(self._save_key)
+        if pending is None or pending is self:
+            return
+        try:
+            await pending.flush()
+        except Exception as e:
+            logger.warning(f"[主动消息] 加载前刷新旧实例待写数据失败喵: {e}")
 
     @staticmethod
     def apply_intensity_seed(
@@ -92,9 +133,76 @@ class StorageService:
             except Exception as e:
                 logger.warning(f"[主动消息] 保存合并后的会话数据失败喵: {e}")
 
-    async def save_data(self) -> None:
-        """将会话数据保存到文件（异步无锁内部实现）。"""
-        await self._store.save(self.plugin.session_data)
+    async def save_data(self, *, immediate: bool = False) -> None:
+        """标记会话数据已变更，并把落盘合并到同一条串行路径。
+
+        默认防抖：1.5 秒内的多次变更只写一次，避免每条私聊消息都在
+        ``data_lock`` 内对整份 session_data.json 做 deepcopy + 落盘。
+        ``immediate=True`` 用于插件卸载等必须立刻持久化的场景。
+        """
+        self._save_version += 1
+        _PENDING_SAVES[self._save_key] = self
+        if immediate:
+            await self.flush()
+            return
+        self._schedule_save()
+
+    def _schedule_save(self) -> None:
+        """安排一次防抖落盘；已有待执行任务时不重复创建。"""
+        if self._save_task is not None and not self._save_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._save_task = loop.create_task(self._debounced_save())
+
+    async def _debounced_save(self) -> None:
+        try:
+            await asyncio.sleep(DEFAULT_SAVE_DEBOUNCE_SECONDS)
+            await self.flush()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"[主动消息] 合并保存会话数据失败喵: {e}")
+
+    def _get_save_lock(self) -> asyncio.Lock:
+        """返回当前事件循环上的保存锁（跨循环复用时重建）。"""
+        loop = asyncio.get_running_loop()
+        if self._save_lock is None or self._save_lock_loop is not loop:
+            self._save_lock = asyncio.Lock()
+            self._save_lock_loop = loop
+        return self._save_lock
+
+    async def flush(self) -> None:
+        """立即把内存快照落盘；并发调用由同一把锁串行化。
+
+        落盘前记录当前版本；写完后若版本已推进（落盘期间又有新变更），
+        继续写一次最新快照，保证不会用旧快照覆盖新状态。
+        """
+        current_task = asyncio.current_task()
+        pending_task = self._save_task
+        if (
+            pending_task is not None
+            and pending_task is not current_task
+            and not pending_task.done()
+        ):
+            pending_task.cancel()
+        self._save_task = None
+
+        while self._saved_version < self._save_version:
+            async with self._get_save_lock():
+                target_version = self._save_version
+                if self._saved_version >= target_version:
+                    continue
+                saved = await self._store.save(self.plugin.session_data)
+                if not saved:
+                    # 保留脏标记与待写登记，下次变更或卸载时重试。
+                    logger.error("[主动消息] 会话数据落盘失败喵，保留待写标记喵。")
+                    return
+                self._saved_version = target_version
+        if _PENDING_SAVES.get(self._save_key) is self:
+            _PENDING_SAVES.pop(self._save_key, None)
 
     def merge_session_info(self, base: dict, incoming: dict) -> dict:
         """转发到 SessionStore 的会话数据合并实现。"""
@@ -161,3 +269,114 @@ class StorageService:
             )
 
         return cleaned_count
+
+    # ------------------------------------------------------------------
+    # 保守淘汰长期未活跃的未启用会话
+    # ------------------------------------------------------------------
+    def _get_stale_retention_days(self) -> float:
+        """读取未启用会话的保留天数，配置缺失/非法时回退默认值。"""
+        config = getattr(self.plugin, "config", None)
+        raw: Any = DEFAULT_STALE_SESSION_DAYS
+        try:
+            private = config.get("private_settings", {}) if config is not None else {}
+            retention = (
+                private.get("data_retention_settings", {})
+                if isinstance(private, dict)
+                else {}
+            )
+            if isinstance(retention, dict):
+                raw = retention.get(
+                    "stale_session_days", DEFAULT_STALE_SESSION_DAYS
+                )
+        except Exception:
+            raw = DEFAULT_STALE_SESSION_DAYS
+        try:
+            days = float(raw)
+        except (TypeError, ValueError):
+            days = float(DEFAULT_STALE_SESSION_DAYS)
+        return max(0.0, days)
+
+    @staticmethod
+    def _as_timestamp(value: Any) -> float:
+        if isinstance(value, bool) or value is None:
+            return 0.0
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @classmethod
+    def _session_last_active_ts(cls, payload: dict[str, Any]) -> float:
+        """从会话载荷中取最近一次活动时间；没有任何时间戳时返回 0。"""
+        candidates: list[Any] = [
+            payload.get("last_message_time"),
+            payload.get("last_scheduled_at"),
+            payload.get("paused_at"),
+            payload.get("cooldown_until"),
+        ]
+        for key, nested_keys in (
+            ("conversation_state", ("last_user_at", "last_proactive_at")),
+            ("conversation_memory", ("last_updated",)),
+            ("persona_state", ("updated_at",)),
+            ("rhythm", ("last_update_ts",)),
+            ("intensity", ("last_user_ts",)),
+            ("last_topic_judge", ("at",)),
+            ("last_guard", ("at",)),
+            ("last_critic", ("at",)),
+        ):
+            nested = payload.get(key)
+            if not isinstance(nested, dict):
+                continue
+            candidates.extend(nested.get(nested_key) for nested_key in nested_keys)
+
+        # 强度事件列表本身也可能比 last_user_ts 更新（旧数据只剩事件）。
+        intensity = payload.get("intensity")
+        if isinstance(intensity, dict):
+            events = intensity.get("events")
+            if isinstance(events, list) and events:
+                last_event = events[-1]
+                if isinstance(last_event, dict):
+                    candidates.append(last_event.get("t"))
+                else:
+                    candidates.append(last_event)
+
+        return max((cls._as_timestamp(value) for value in candidates), default=0.0)
+
+    def prune_stale_session_data(self, *, now: float | None = None) -> int:
+        """保守淘汰未启用且长期无活动的会话，返回清理条数。
+
+        只动 ``enable=false`` 的会话；启用中的会话、有近期活动时间戳的
+        会话、以及完全没有时间戳的会话一律保留，避免误删仍在使用的数据。
+        """
+        plugin = self.plugin
+        retention_days = self._get_stale_retention_days()
+        if retention_days <= 0:
+            return 0
+
+        current_time = time.time() if now is None else float(now)
+        threshold = current_time - retention_days * 86400.0
+        removed = 0
+
+        for session_id in list(plugin.session_data.keys()):
+            payload = plugin.session_data.get(session_id)
+            if not isinstance(payload, dict):
+                continue
+            try:
+                session_config = plugin.config_service.get_session_config(session_id)
+            except Exception:
+                session_config = None
+            if session_config and session_config.get("enable", False):
+                continue
+
+            last_active = self._session_last_active_ts(payload)
+            if last_active <= 0 or last_active >= threshold:
+                continue
+
+            del plugin.session_data[session_id]
+            removed += 1
+            logger.info(
+                f"[主动消息] 已清理 {retention_days:g} 天未活跃的未启用会话数据: "
+                f"{plugin.session_service.get_session_log_str(session_id)}"
+            )
+
+        return removed

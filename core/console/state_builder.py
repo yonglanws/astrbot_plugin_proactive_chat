@@ -25,6 +25,9 @@ from ..services.scheduler_service import (
 class StateBuilder:
     """构建运行状态、任务卡片、会话摘要、强度面板与文档列表载荷。"""
 
+    # /api/intensity 前端每 30 秒轮询一次；短 TTL 缓存吸收重复请求。
+    INTENSITY_CACHE_TTL_SECONDS = 15.0
+
     def __init__(
         self,
         plugin: Any,
@@ -35,6 +38,7 @@ class StateBuilder:
         self._metadata_version = metadata_version
         # WebSocket 连接计数由实时通道提供，供状态载荷展示连接状态。
         self._connection_counter = connection_counter or (lambda: 0)
+        self._intensity_payload_cache: tuple[float, dict[str, Any]] | None = None
 
     @staticmethod
     def _coerce_int(value: Any, default: int = 0) -> int:
@@ -553,8 +557,8 @@ class StateBuilder:
             )
         return result
 
-    def collect_intensity_sessions(self) -> list[dict[str, Any]]:
-        """构建互动强度面板数据。"""
+    def _build_intensity_snapshots(self) -> list[dict[str, Any]]:
+        """计算全部已知私聊会话的强度快照并补上启用状态。"""
         service = getattr(self.plugin, "intensity_service", None)
         if service is None:
             return []
@@ -571,6 +575,48 @@ class StateBuilder:
             )
             item["enabled"] = bool(session_config.get("enable", False))
         return snapshots
+
+    def collect_intensity_sessions(self) -> list[dict[str, Any]]:
+        """构建互动强度面板数据。"""
+        return self._build_intensity_snapshots()
+
+    def collect_intensity_payload(self, *, now: float | None = None) -> dict[str, Any]:
+        """一次遍历同时产出强度面板数据与汇总，并带短 TTL 缓存。
+
+        路由原先分别调用 collect_intensity_sessions 与
+        build_intensity_summary，各评估一遍全部会话；这里复用同一份
+        snapshots。方法本身是同步的，由路由放到线程池执行，避免阻塞事件循环。
+        """
+        current = time.time() if now is None else float(now)
+        cached = self._intensity_payload_cache
+        if (
+            cached is not None
+            and 0 <= current - cached[0] < self.INTENSITY_CACHE_TTL_SECONDS
+        ):
+            return cached[1]
+
+        try:
+            snapshots = self._build_intensity_snapshots()
+            service = getattr(self.plugin, "intensity_service", None)
+            summary: dict[str, Any] = {}
+            if service is not None:
+                summary_builder = getattr(service, "summary_from_snapshots", None)
+                if callable(summary_builder):
+                    summary = summary_builder(snapshots)
+                else:
+                    session_ids = [
+                        str(item.get("session_id", "")) for item in snapshots
+                    ]
+                    if self._accepts_read_only(service.summary):
+                        summary = service.summary(session_ids, read_only=True)
+                    else:
+                        summary = service.summary(session_ids)
+            payload = {"sessions": snapshots, "summary": summary}
+        except Exception:
+            return {"sessions": [], "summary": {}}
+
+        self._intensity_payload_cache = (current, payload)
+        return payload
 
     # ------------------------------------------------------------------
     # Markdown 文档

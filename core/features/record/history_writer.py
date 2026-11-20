@@ -37,6 +37,10 @@ class RecordStage(BaseStage):
             ctx.unanswered_count,
             intent=extra.get("intent"),
             started_at=getattr(ctx, "started_at", None),
+            llm_response_dispatched=bool(
+                extra.get("llm_response_hooks_dispatched", False)
+            ),
+            llm_original_text=extra.get("llm_response_original_text"),
         )
         return StageResult.CONTINUE
 
