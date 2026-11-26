@@ -63,12 +63,30 @@ class ContextStage(BaseStage):
         if request_package.get("persona_name"):
             humanization["persona_name"] = request_package["persona_name"]
 
+        resolved_persona_id = str(
+            request_package.get("persona_id")
+            or getattr(request_package.get("conversation"), "persona_id", "")
+            or request_package.get("persona_name")
+            or ""
+        ).strip()
+        ctx.extra["persona_id"] = resolved_persona_id
+
         session_config = (
             plugin.config_service.get_session_config(effective_session_id) or {}
         )
         state_session_id = session_id
 
         async def _collect_humanization_locked() -> str:
+            reset_fn = getattr(
+                plugin.context_service,
+                "reset_session_state_on_persona_change",
+                None,
+            )
+            if callable(reset_fn) and resolved_persona_id:
+                try:
+                    reset_fn(state_session_id, resolved_persona_id)
+                except Exception as e:
+                    logger.debug(f"[主动消息] 检查人格切换状态失败喵: {e}")
             try:
                 humanization["conversation_state"] = (
                     plugin.conversation_state_service.snapshot(
@@ -128,24 +146,44 @@ class ContextStage(BaseStage):
         ctx.extra["topic_context"] = topic_context
 
         memory_context = ""
+        memory_recalled_via_bridge = False
+        memory_plugin_id = "astrbot_plugin_livingmemory"
         memory_bridge = getattr(plugin, "memory_bridge", None)
         if memory_bridge is not None:
             try:
-                query = self.build_memory_query(
-                    request_package.get("history", [])
-                    or request_package.get("raw_history", []),
-                    humanization,
-                )
-                persona_id = getattr(
-                    request_package.get("conversation"), "persona_id", None
-                )
-                memories = await memory_bridge.recall(
-                    effective_session_id,
-                    query,
-                    persona_id=persona_id,
-                )
-                memory_context = memory_bridge.format_memories(memories)
-                humanization["memory_count"] = len(memories)
+                get_settings_fn = getattr(memory_bridge, "get_settings", None)
+                if callable(get_settings_fn):
+                    mem_settings = get_settings_fn(session_config)
+                    memory_plugin_id = (
+                        getattr(mem_settings, "plugin_id", None)
+                        or memory_plugin_id
+                    )
+                    bridge_enabled = bool(
+                        getattr(mem_settings, "enabled", True)
+                        and getattr(mem_settings, "inject_into_prompt", True)
+                    )
+                else:
+                    bridge_enabled = True
+
+                if bridge_enabled:
+                    query = self.build_memory_query(
+                        request_package.get("history", [])
+                        or request_package.get("raw_history", []),
+                        humanization,
+                    )
+                    persona_id = resolved_persona_id or getattr(
+                        request_package.get("conversation"), "persona_id", None
+                    )
+                    memories = await memory_bridge.recall(
+                        effective_session_id,
+                        query,
+                        persona_id=persona_id,
+                    )
+                    memory_context = memory_bridge.format_memories(memories)
+                    humanization["memory_count"] = len(memories)
+                    # 只要 bridge 本轮已尝试召回（无论是否命中），就标记去重，
+                    # 避免随后的 OnLLMRequestEvent 再次触发 LivingMemory 二次召回。
+                    memory_recalled_via_bridge = True
             except Exception as e:
                 logger.debug(f"[主动消息] 召回长期记忆失败喵: {e}")
         ctx.extra["memory_context"] = memory_context
@@ -154,6 +192,14 @@ class ContextStage(BaseStage):
         # 保持 ctx.session_id 与入口锁/start_state 一致，不中途覆盖。
         ctx.session = plugin.session_service.build_session_key(ctx.session_id)
         ctx.event = plugin.sender_service.build_proactive_event(ctx.session_id)
+        if ctx.event is not None:
+            set_extra = getattr(ctx.event, "set_extra", None)
+            if callable(set_extra):
+                if resolved_persona_id:
+                    set_extra("_trace_persona_id", resolved_persona_id)
+                if memory_recalled_via_bridge:
+                    set_extra("_proactive_memory_recalled", True)
+                    set_extra("_proactive_memory_plugin_id", memory_plugin_id)
 
         # start_state 已在流水线起点记录；这里不再覆盖，否则 GATE -> CONTEXT
         # 之间到达的用户消息会被当成新的基线而漏检。

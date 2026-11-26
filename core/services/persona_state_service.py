@@ -179,32 +179,33 @@ class PersonaStateService:
 
     @staticmethod
     def _derive_activity(hour: int, *, is_weekend: bool = False) -> str:
+        """返回中性时段状态描述，不预设睡眠或进食等具体作息（由人格设定自行决定）。"""
         hour = int(hour) % 24
         if is_weekend:
             if hour < 7:
-                return "还没睡或刚睡下"
+                return "周末深夜时段，四周比较安静"
             if hour < 10:
-                return "周末刚醒，在赖床"
+                return "周末上午，节奏比较松散"
             if hour < 13:
-                return "周末慢悠悠吃点东西"
+                return "周末午间，空余时间较多"
             if hour < 18:
-                return "周末在外面逛或宅着摸鱼"
+                return "周末下午，在忙自己的事或随手刷手机"
             if hour < 22:
-                return "周末晚上在放松"
-            return "准备睡了"
+                return "周末傍晚到晚间，节奏轻松"
+            return "周末夜深了，四周安静下来"
         if hour < 6:
-            return "准备休息"
+            return "深夜时段，四周很安静"
         if hour < 9:
-            return "刚醒，在慢慢进入状态"
+            return "清晨到早间，新的一天刚开始"
         if hour < 12:
-            return "在忙自己的事"
+            return "上午，在忙自己的事"
         if hour < 14:
-            return "在吃饭或歇一会儿"
+            return "午间空档，节奏稍微放缓"
         if hour < 18:
-            return "在忙，但偶尔会看手机"
+            return "下午，在忙但偶尔会看手机"
         if hour < 22:
-            return "忙完了在放松"
-        return "准备睡了"
+            return "晚间，节奏慢了下来"
+        return "夜深了，四周比较安静"
 
     # ------------------------------------------------------------------
     # 事件

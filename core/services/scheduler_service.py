@@ -29,6 +29,7 @@ PAUSE_REASON = "pause_reason"
 PAUSE_UNANSWERED = "paused_unanswered_count"
 PAUSE_THRESHOLD = "paused_threshold"
 PAUSE_REASON_MAX_UNANSWERED = "max_unanswered"
+PAUSE_REASON_PERMANENT_SEND_ERROR = "permanent_send_error"
 COOLDOWN_UNTIL = "cooldown_until"
 SCHEDULE_CANCELLED_FLAG = "schedule_cancelled"
 
@@ -304,6 +305,11 @@ class SchedulerService:
             logger.info(
                 f"[主动消息] {plugin.session_service.get_session_log_str(session_id)} "
                 f"收到用户的明确负反馈，已暂停主动消息，等待用户之后重新开启话题喵。"
+            )
+        elif reason == PAUSE_REASON_PERMANENT_SEND_ERROR:
+            logger.warning(
+                f"[主动消息] {plugin.session_service.get_session_log_str(session_id)} "
+                f"命中永久性投递失败（如无好友关系/无权限），已暂停主动消息以避免无限重调度消耗 LLM 喵。"
             )
         else:
             logger.info(

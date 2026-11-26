@@ -35,6 +35,9 @@ def _safe_non_negative_int(value: Any, default: int) -> int:
         return default
 
 
+DEFAULT_MAX_CONCURRENT_TASKS = 3
+
+
 class FlowOrchestrator:
     """组织并执行主动消息流水线。"""
 
@@ -42,6 +45,33 @@ class FlowOrchestrator:
         self.plugin = plugin
         self._runner: PipelineRunner | None = None
         self._active_manual_owners: dict[str, object] = {}
+        self._semaphore_cache: tuple[int, int, asyncio.Semaphore] | None = None
+
+    def _resolve_max_concurrent_tasks(self) -> int:
+        """读取全局并发上限（默认 3，最小 1），避免多会话同时触发压垮 LLM/记忆库。"""
+        config = getattr(self.plugin, "config", None)
+        raw: Any = None
+        if hasattr(config, "get"):
+            private_conf = config.get("private_settings") or config.get("friend_settings") or {}
+            if isinstance(private_conf, dict):
+                sched = private_conf.get("schedule_settings") or {}
+                if isinstance(sched, dict):
+                    raw = sched.get("max_concurrent_tasks")
+            if raw is None:
+                raw = config.get("max_concurrent_tasks")
+        limit = _safe_non_negative_int(raw, DEFAULT_MAX_CONCURRENT_TASKS)
+        return max(1, limit)
+
+    def _get_concurrency_semaphore(self) -> asyncio.Semaphore:
+        """获取绑定到当前事件循环的全局并发信号量。"""
+        loop_id = id(asyncio.get_running_loop())
+        limit = self._resolve_max_concurrent_tasks()
+        cached = self._semaphore_cache
+        if cached is not None and cached[0] == loop_id and cached[1] == limit:
+            return cached[2]
+        sem = asyncio.Semaphore(limit)
+        self._semaphore_cache = (loop_id, limit, sem)
+        return sem
 
     def invalidate_runner(self) -> None:
         """重置缓存的流水线实例，使最新配置在下次运行时重新装配。"""
@@ -220,7 +250,8 @@ class FlowOrchestrator:
             owner_token = object()
             self._active_manual_owners[normalized_session_id] = owner_token
         try:
-            await self._run_locked(normalized_session_id, trigger)
+            async with self._get_concurrency_semaphore():
+                await self._run_locked(normalized_session_id, trigger)
         finally:
             active_sessions.discard(normalized_session_id)
             if owner_token is not None:

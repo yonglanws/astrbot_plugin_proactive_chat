@@ -92,6 +92,75 @@ def resolve_sender_hint(plugin: Any, umo: str) -> tuple[str, str]:
     return "", ""
 
 
+def resolve_session_plugins_name(plugin: Any, session_id: str) -> list[str] | None:
+    """按会话生效的 AstrBot 配置解析 plugin_set 插件白名单。
+
+    行为与 AstrBot 本体保持一致：
+    - 配置为 ["*"]、包含 "*" 或读取失败时返回 None（允许全部已激活插件）；
+    - 否则返回显式白名单列表（空列表表示禁用所有非保留插件），避免主动消息
+      伪事件绕过受限 bot（如 wsbot）的 plugin_set 导致跨 bot 钩子污染。
+    """
+    context = getattr(plugin, "context", None)
+    get_config = getattr(context, "get_config", None)
+    if not callable(get_config):
+        return None
+    try:
+        try:
+            cfg = get_config(umo=session_id)
+        except TypeError:
+            cfg = get_config()
+    except Exception:
+        return None
+    if cfg is None or not hasattr(cfg, "get"):
+        return None
+    enabled = cfg.get("plugin_set", ["*"])
+    if not isinstance(enabled, list) or "*" in enabled:
+        return None
+    return [str(name) for name in enabled]
+
+
+def _should_skip_duplicate_memory_hook(
+    event: Any, hook_type: Any, handler: Any
+) -> bool:
+    """当 ContextStage 已通过 memory_bridge 完成召回时，跳过同类插件的 OnLLMRequestEvent。
+
+    只检查 StarHandlerMetadata 的名称/模块路径字符串，不做任何跨插件 Python import。
+    """
+    if EventType is None or hook_type != EventType.OnLLMRequestEvent:
+        return False
+    getter = getattr(event, "get_extra", None)
+    already_recalled = False
+    target_plugin_id = "astrbot_plugin_livingmemory"
+    if callable(getter):
+        try:
+            already_recalled = bool(getter("_proactive_memory_recalled", False))
+            configured = getter("_proactive_memory_plugin_id", None)
+            if isinstance(configured, str) and configured.strip():
+                target_plugin_id = configured.strip()
+        except TypeError:
+            try:
+                already_recalled = bool(getter("_proactive_memory_recalled"))
+                configured = getter("_proactive_memory_plugin_id")
+                if isinstance(configured, str) and configured.strip():
+                    target_plugin_id = configured.strip()
+            except Exception:
+                return False
+        except Exception:
+            return False
+    if not already_recalled:
+        return False
+
+    module_path = str(getattr(handler, "handler_module_path", "") or "").lower()
+    full_name = str(getattr(handler, "handler_full_name", "") or "").lower()
+    target_lower = target_plugin_id.lower()
+    return (
+        target_lower in module_path
+        or target_lower in full_name
+        or "livingmemory" in module_path
+        or "livingmemory" in full_name
+    )
+
+
 async def dispatch_event_hook(
     event: Any,
     hook_type: Any,
@@ -115,6 +184,14 @@ async def dispatch_event_hook(
         return False
 
     for handler in handlers or []:
+        if _should_skip_duplicate_memory_hook(event, hook_type, handler):
+            handler_name = getattr(handler, "handler_full_name", None) or getattr(
+                handler, "handler_name", "unknown"
+            )
+            logger.debug(
+                f"[主动消息] 本轮已通过 memory_bridge 召回记忆，跳过重复钩子 {handler_name} 喵。"
+            )
+            continue
         handler_name = getattr(handler, "handler_full_name", None) or getattr(
             handler, "handler_name", "unknown"
         )
@@ -173,6 +250,7 @@ class ProactiveMessageEvent(_EventBase):  # type: ignore[misc, valid-type]
         self._proactive_persist_history = persist_history
         self.proactive_sent_chains: list[MessageChain] = []
         self.proactive_send_failed = False
+        self.proactive_last_error = ""
 
         message_obj = AstrBotMessage()
         message_obj.type = message_type
@@ -194,7 +272,7 @@ class ProactiveMessageEvent(_EventBase):  # type: ignore[misc, valid-type]
             session_id=target_id,
         )
 
-        self.plugins_name = None
+        self.plugins_name = resolve_session_plugins_name(plugin, session_id)
         self.is_wake = True
         self.is_at_or_wake_command = True
         self.role = "member"
@@ -229,6 +307,7 @@ class ProactiveMessageEvent(_EventBase):  # type: ignore[misc, valid-type]
         self.proactive_sent_chains.append(message)
 
         sent = False
+        self.proactive_last_error = ""
         platform = self._resolve_platform()
         # 平台实例可用且运行中时优先直发。
         if platform is not None and platform.status == PlatformStatus.RUNNING:
@@ -244,6 +323,7 @@ class ProactiveMessageEvent(_EventBase):  # type: ignore[misc, valid-type]
                     await platform.send_by_session(session_obj, message)
                     sent = True
                 except Exception as e:
+                    self.proactive_last_error = str(e)
                     logger.error(f"[主动消息] 平台发送失败喵，尝试核心 API 兜底: {e}")
 
         if not sent:
@@ -254,6 +334,7 @@ class ProactiveMessageEvent(_EventBase):  # type: ignore[misc, valid-type]
             logger.error("[主动消息] 事件发送失败喵：平台与核心 API 均未能送达。")
             return False
 
+        self.proactive_last_error = ""
         self._has_send_oper = True
         await self._persist_sent_chain(message)
         return True
@@ -266,9 +347,18 @@ class ProactiveMessageEvent(_EventBase):  # type: ignore[misc, valid-type]
         try:
             result = await plugin.context.send_message(self._proactive_umo, message)
         except Exception as e:  # pragma: no cover - 取决于运行时
+            err_str = str(e)
+            if err_str:
+                self.proactive_last_error = (
+                    f"{self.proactive_last_error} | {err_str}"
+                    if self.proactive_last_error and err_str not in self.proactive_last_error
+                    else (self.proactive_last_error or err_str)
+                )
             logger.error(f"[主动消息] 核心 API 发送失败喵: {e}")
             return False
         if result is False:
+            if not self.proactive_last_error:
+                self.proactive_last_error = "核心 API 未找到匹配平台"
             logger.warning("[主动消息] 核心 API 未找到匹配平台，消息未送达喵。")
             return False
         return True
@@ -412,4 +502,5 @@ __all__ = [
     "resolve_platform_instance",
     "resolve_self_id",
     "resolve_sender_hint",
+    "resolve_session_plugins_name",
 ]

@@ -7,9 +7,14 @@ from typing import Any
 
 from astrbot.api import logger
 
-from ...domain.delivery_report import DeliveryReport
+from ...domain.delivery_report import DeliveryReport, is_permanent_delivery_error
 from ...domain.domain_enums import HookPoint, StageResult
 from ...pipeline.stage_protocol import BaseStage
+from ...services.scheduler_service import PAUSE_REASON_PERMANENT_SEND_ERROR
+
+_CONSECUTIVE_SEND_FAILURES_KEY = "consecutive_send_failures"
+_TRANSIENT_BACKOFF_BASE_SECONDS = 1800
+_TRANSIENT_BACKOFF_MAX_SECONDS = 6 * 3600
 
 
 class DeliverStage(BaseStage):
@@ -85,11 +90,62 @@ class DeliverStage(BaseStage):
                 )
                 ctx.abort("new_message_before_send")
                 return StageResult.STOP
+
+            is_permanent = bool(
+                report.permanent_failure
+                or is_permanent_delivery_error(report.error_message)
+            )
+            if is_permanent:
+                logger.warning(
+                    f"[主动消息] {plugin.session_service.get_session_log_str(session_id)} "
+                    f"命中永久性发送失败（{report.error_message}），将暂停该会话的主动消息并停止重调度喵。"
+                )
+                scheduler_service = getattr(plugin, "scheduler_service", None)
+                pause_fn = getattr(scheduler_service, "pause_session", None)
+                if callable(pause_fn):
+                    lock = getattr(plugin, "data_lock", None)
+                    if lock is not None:
+                        async with lock:
+                            await pause_fn(
+                                session_id,
+                                reason=PAUSE_REASON_PERMANENT_SEND_ERROR,
+                            )
+                    else:
+                        await pause_fn(
+                            session_id,
+                            reason=PAUSE_REASON_PERMANENT_SEND_ERROR,
+                        )
+                ctx.abort("permanent_send_error")
+                return StageResult.STOP
+
+            # 非永久性错误：连续失败时施加指数退避，防止持续异常高频空转消耗 LLM。
+            session_data = getattr(plugin, "session_data", None)
+            if isinstance(session_data, dict):
+                payload = session_data.setdefault(session_id, {})
+                if isinstance(payload, dict):
+                    fail_count = int(payload.get(_CONSECUTIVE_SEND_FAILURES_KEY, 0) or 0) + 1
+                    payload[_CONSECUTIVE_SEND_FAILURES_KEY] = fail_count
+                    if fail_count >= 2:
+                        backoff = min(
+                            _TRANSIENT_BACKOFF_MAX_SECONDS,
+                            _TRANSIENT_BACKOFF_BASE_SECONDS * (2 ** (fail_count - 2)),
+                        )
+                        ctx.extra["retry_after_seconds"] = max(
+                            int(ctx.extra.get("retry_after_seconds") or 0),
+                            backoff,
+                        )
+
             logger.warning(
                 f"[主动消息] {plugin.session_service.get_session_log_str(session_id)} 的本次主动消息未能送达，已跳过存档与计数并重新调度喵。"
             )
             ctx.abort("send_failed")
             return StageResult.RESCHEDULE
+
+        session_data = getattr(plugin, "session_data", None)
+        if isinstance(session_data, dict):
+            payload = session_data.get(session_id)
+            if isinstance(payload, dict) and _CONSECUTIVE_SEND_FAILURES_KEY in payload:
+                payload.pop(_CONSECUTIVE_SEND_FAILURES_KEY, None)
         return StageResult.CONTINUE
 
 

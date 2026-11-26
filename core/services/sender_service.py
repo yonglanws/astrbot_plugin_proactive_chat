@@ -30,7 +30,7 @@ from ..adapters.astrbot_event import (
     resolve_message_type,
 )
 from ..adapters.astrbot_platform import find_platform_by_id
-from ..domain.delivery_report import DeliveryReport
+from ..domain.delivery_report import DeliveryReport, is_permanent_delivery_error
 
 try:  # pragma: no cover - 取决于 AstrBot 版本
     from astrbot.core.star.star_handler import EventType
@@ -58,6 +58,17 @@ class SenderService:
 
     def __init__(self, plugin: Any) -> None:
         self.plugin = plugin
+        self._last_send_errors: dict[str, str] = {}
+
+    def _record_send_error(self, session_id: str, error: Any) -> None:
+        err_text = str(error or "").strip()
+        if not err_text:
+            return
+        prev = self._last_send_errors.get(session_id, "")
+        if not prev:
+            self._last_send_errors[session_id] = err_text
+        elif err_text not in prev:
+            self._last_send_errors[session_id] = f"{prev} | {err_text}"
 
     # ------------------------------------------------------------------
     # 文本分段
@@ -409,6 +420,7 @@ class SenderService:
             await self.persist_proactive_message_to_platform_history(session_id, chain)
             return True
         except Exception as e:
+            self._record_send_error(session_id, e)
             logger.error(f"[主动消息] 通过平台 {p_id} 发送失败喵: {e}")
             logger.debug(traceback.format_exc())
             if plugin.telemetry and plugin.telemetry.enabled:
@@ -433,15 +445,18 @@ class SenderService:
         try:
             result = await plugin.context.send_message(session_id, chain)
         except Exception as e:
+            self._record_send_error(session_id, e)
             logger.error(f"[主动消息] 核心 API 发送失败喵: {e}")
             return False
 
         if result is False:
+            self._record_send_error(session_id, "核心 API 未能找到匹配平台")
             logger.error(
                 f"[主动消息] 核心 API 未能找到匹配平台，消息未送达喵: {session_id}"
             )
             return False
 
+        self._last_send_errors.pop(session_id, None)
         await self.persist_proactive_message_to_platform_history(session_id, chain)
         return True
 
@@ -465,6 +480,7 @@ class SenderService:
             try:
                 sent = await event.send(chain)
             except Exception as e:
+                self._record_send_error(session_id, e)
                 logger.error(f"[主动消息] 事件发送异常喵，回退平台直发: {e}")
                 sent_direct = await self.send_chain_direct(session_id, components)
                 if sent_direct:
@@ -524,6 +540,13 @@ class SenderService:
                 f"[主动消息] 发送前检测到新状态，取消 {plugin.session_service.get_session_log_str(session_id, session_config)} 的本次发送喵。"
             )
             return False
+
+        self._last_send_errors.pop(session_id, None)
+        if event is not None and hasattr(event, "proactive_last_error"):
+            try:
+                event.proactive_last_error = ""
+            except Exception:
+                pass
 
         logger.info(
             f"[主动消息] 开始发送 {plugin.session_service.get_session_log_str(session_id, session_config)} 的主动消息喵。"
@@ -759,10 +782,23 @@ class SenderService:
         self._clear_event_result(event)
 
         if not any_sent:
+            event_err = str(getattr(event, "proactive_last_error", "") or "").strip()
+            service_err = str(self._last_send_errors.pop(session_id, "") or "").strip()
+            combined_parts = []
+            for part in (event_err, service_err):
+                if part and part not in combined_parts:
+                    combined_parts.append(part)
+            err_text = " | ".join(combined_parts)
+            if err_text:
+                report.error_message = err_text
+                report.permanent_failure = is_permanent_delivery_error(err_text)
             logger.error(
                 f"[主动消息] {plugin.session_service.get_session_log_str(session_id, session_config)} 的主动消息未能送达任何平台喵。"
+                + (f" 错误: {err_text}" if err_text else "")
             )
             return False
+
+        self._last_send_errors.pop(session_id, None)
 
         # 只有至少一条消息真正送达后才派发“发送后”钩子，
         # 避免其他插件把失败发送记成一条实际不存在的消息。

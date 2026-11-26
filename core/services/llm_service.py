@@ -117,6 +117,15 @@ class LlmService:
             lines.append(
                 f"- 你上一次主动消息：{format_relative_gap(now - last_proactive_at)}"
             )
+        if not (
+            (isinstance(last_user_at, (int, float)) and last_user_at > 0)
+            or (isinstance(last_proactive_at, (int, float)) and last_proactive_at > 0)
+        ):
+            last_history_at = humanization.get("last_history_at")
+            if isinstance(last_history_at, (int, float)) and last_history_at > 0:
+                lines.append(
+                    f"- 距上一条历史消息：{format_relative_gap(now - last_history_at)}"
+                )
         intent_label = humanization.get("intent_label")
         brief = humanization.get("intent_brief")
         if intent_label:
@@ -358,7 +367,12 @@ class LlmService:
         history_messages = plugin.context_service.sanitize_history_content(
             history_messages or []
         )
-        history_messages = self._annotate_history_timestamps(history_messages)
+        # 保持历史消息前缀完全不可变，确保上游 LLM KV Prompt Cache 命中；
+        # 不再向历史上下文注入会随时间变化的相对时间戳，只把最近时间间隔写入尾部的 <dynamic_context>。
+        latest_history_ts = self._extract_latest_history_timestamp(history_messages)
+        if latest_history_ts is not None and "last_history_at" not in humanization:
+            humanization = dict(humanization)
+            humanization["last_history_at"] = latest_history_ts
         # prompt_context 关闭时不追加强度动态上下文；用户在模板里显式写的
         # 占位符仍会正常替换，避免“配置关闭”与“模板要求”互相打架。
         context_intensity_snapshot = intensity_snapshot
@@ -498,33 +512,23 @@ class LlmService:
         )
 
     @staticmethod
-    def _annotate_history_timestamps(history: list) -> list:
-        """为带时间戳的对话历史补充相对时间提示（仅在相邻间隔>=30分钟时标注）。"""
-        if not history:
-            return history
-        now = time.time()
-        prev_ts: float | None = None
-        annotated: list = []
-        for item in history:
+    def _extract_latest_history_timestamp(history: list) -> float | None:
+        """从历史消息中只读提取最近一条带时间戳消息的秒级时间（不修改历史内容）。"""
+        latest: float | None = None
+        for item in history or []:
             if not isinstance(item, dict):
-                annotated.append(item)
                 continue
             raw_ts = item.get("timestamp") or item.get("created_at") or item.get("time")
-            ts_val: float | None = None
             if isinstance(raw_ts, (int, float)) and raw_ts > 0:
                 ts_val = float(raw_ts) / 1000.0 if raw_ts > 1e12 else float(raw_ts)
-            if ts_val is not None and (prev_ts is None or ts_val - prev_ts >= 1800):
-                content = str(item.get("content") or "")
-                if content and not content.startswith("["):
-                    copy_item = dict(item)
-                    copy_item["content"] = f"[{format_relative_gap(now - ts_val)}] {content}"
-                    annotated.append(copy_item)
-                    prev_ts = ts_val
-                    continue
-            if ts_val is not None:
-                prev_ts = ts_val
-            annotated.append(item)
-        return annotated
+                if latest is None or ts_val > latest:
+                    latest = ts_val
+        return latest
+
+    @staticmethod
+    def _annotate_history_timestamps(history: list) -> list:
+        """保留兼容签名的只读透传（已停用历史内动态相对时间注入，避免破坏 KV Prompt Cache）。"""
+        return list(history) if isinstance(history, list) else history
 
     @staticmethod
     def resolve_final_user_prompt(req: Any, fallback: str) -> str:
