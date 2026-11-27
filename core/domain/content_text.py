@@ -6,10 +6,27 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 # 内容分段中可能承载文本的键名（不同 AstrBot 版本/场景存在差异）。
 _TEXT_KEYS: tuple[str, ...] = ("text", "content", "message", "value")
+_STICKER_TAG_RE = re.compile(
+    r"<sticker\b[^>]*/>|<sticker\b[^>]*>.*?</sticker>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def strip_sticker_tags(text: Any) -> str:
+    """移除内联 `<sticker .../>` 标签，避免污染持久化历史与重复相似度判断。"""
+    raw = str(text or "")
+    if not raw or "<sticker" not in raw.lower():
+        return raw.strip()
+    cleaned = _STICKER_TAG_RE.sub("", raw)
+    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    return cleaned.strip()
 
 
 def reduce_record_text(content: Any) -> str:

@@ -681,9 +681,54 @@ class DeliveryPlan:
         }
 
 
+_STICKER_TAG_RE = re.compile(
+    r"<sticker\b[^>]*/>|<sticker\b[^>]*>.*?</sticker>",
+    re.IGNORECASE | re.DOTALL,
+)
+_PUNCT_AND_SPACE_RE = re.compile(
+    r"[\s\.,!?;:\"'`~\-—…·、。，！？；：“”‘’（）()\[\]【】《》「」『』～]+"
+)
+
+
+def _semantic_core(text: str) -> str:
+    """提取剥离 `<sticker .../>` 标签和纯标点空白后的语义文本。"""
+    without_tags = _STICKER_TAG_RE.sub("", str(text or ""))
+    return _PUNCT_AND_SPACE_RE.sub("", without_tags)
+
+
 def _split_sentences(text: str) -> list[str]:
-    parts = re.split(r"(?<=[。！？!?…~])\s*|\n+", str(text or ""))
+    parts = re.split(
+        r"(?<=[。！？!?…~～])(?![。！？!?…~～”’\"'\)\]】》」』])\s*|\n+",
+        str(text or ""),
+    )
     return [part.strip() for part in parts if part and part.strip()]
+
+
+def _merge_short_or_punct_bubbles(bubbles: list[str]) -> list[str]:
+    """把纯标点、纯标签或极短（<=1 个语义字）的气泡碎片并入相邻语义气泡。"""
+    items = [str(item or "").strip() for item in bubbles if str(item or "").strip()]
+    if len(items) <= 1:
+        return items
+
+    merged: list[str] = []
+    pending_prefix = ""
+    for item in items:
+        candidate = f"{pending_prefix}{item}" if pending_prefix else item
+        pending_prefix = ""
+        if len(_semantic_core(candidate)) <= 1:
+            if merged:
+                merged[-1] = f"{merged[-1]}{candidate}"
+            else:
+                pending_prefix = candidate
+            continue
+        merged.append(candidate)
+
+    if pending_prefix:
+        if merged:
+            merged[0] = f"{pending_prefix}{merged[0]}"
+        else:
+            merged.append(pending_prefix)
+    return merged
 
 
 def _strip_casual_period(bubble_text: str) -> str:
@@ -769,14 +814,17 @@ def build_delivery_plan(
 
     explicit_lines = [line.strip() for line in normalized.splitlines() if line.strip()]
     if settings.max_bubbles > 1 and len(explicit_lines) >= 2 and len(normalized) <= settings.bubble_length_threshold:
-        groups = _group_sentences(explicit_lines, settings.max_bubbles)
+        merged_lines = _merge_short_or_punct_bubbles(explicit_lines)
+        groups = _group_sentences(merged_lines, settings.max_bubbles)
     elif len(normalized) <= settings.bubble_length_threshold or settings.max_bubbles <= 1:
         groups = [normalized]
     else:
-        sentences = _split_sentences(normalized)
+        sentences = _merge_short_or_punct_bubbles(_split_sentences(normalized))
         groups = _group_sentences(sentences, settings.max_bubbles) or [normalized]
 
-    groups = [_strip_casual_period(g) or g for g in groups]
+    groups = _merge_short_or_punct_bubbles(
+        [_strip_casual_period(g) or g for g in groups]
+    )
 
     first_delay = generator.uniform(
         min(settings.first_delay_min_seconds, settings.first_delay_max_seconds),

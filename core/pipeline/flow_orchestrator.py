@@ -369,9 +369,12 @@ class FlowOrchestrator:
             return
 
         normalized_session_id = plugin.session_service.normalize_session_id(session_id)
+        from ..domain.content_text import strip_sticker_tags
 
-        if not (assistant_response or "").strip():
-            logger.debug("[主动消息] 本次结果无文本内容，跳过对话历史存档喵。")
+        persisted_response = strip_sticker_tags(assistant_response)
+
+        if not persisted_response:
+            logger.debug("[主动消息] 本次结果无纯文本内容，跳过对话历史存档喵。")
         else:
             try:
                 # 只存档 assistant 主动消息，不再把完整主动提示词伪装成
@@ -379,13 +382,13 @@ class FlowOrchestrator:
                 await add_assistant_message(
                     plugin.context.conversation_manager,
                     conv_id,
-                    assistant_response,
+                    persisted_response,
                 )
                 if await verify_message_persisted(
                     plugin.context.conversation_manager,
                     normalized_session_id,
                     conv_id,
-                    assistant_response,
+                    persisted_response,
                 ):
                     logger.info("[主动消息] 已成功将本次主动消息存档至对话历史喵。")
                 else:

@@ -39,6 +39,15 @@ _AI_TONE_RE = re.compile(
     r"如果有需要|祝你一切顺利|期待你的回复|希望这能帮到你)",
     re.IGNORECASE,
 )
+_CLICHE_CARE_RE = re.compile(
+    r"(多喝[点些]?(?:温|热)?水|喝[点杯口]?温水|记得喝[温热]?水|"
+    r"吃[点顿]?热乎的|记得按时吃饭|注意保暖|别着凉|"
+    r"昨天你不是说|前几天你不是说|上次你不是说|之前你不是还?说)",
+    re.IGNORECASE,
+)
+_LEADING_ELLIPSIS_RE = re.compile(
+    r"^\s*(?:…{1,}|\.{3,})(?=$|\s|[,，。！？!?])"
+)
 
 _CANNED_OPENER_GROUPS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
@@ -218,6 +227,10 @@ class GuardService:
             reasons.append("ai_self_reference_or_neediness")
         if _AI_TONE_RE.search(content):
             reasons.append("ai_tone")
+        if _CLICHE_CARE_RE.search(content):
+            reasons.append("cliche_expression")
+        if _LEADING_ELLIPSIS_RE.search(content):
+            reasons.append("leading_ellipsis")
 
         return reasons
 
@@ -331,6 +344,8 @@ class GuardService:
             "too_many_questions": "连续提问太多，像在查户口",
             "ai_self_reference_or_neediness": "有 AI 自指或索取情绪价值的味道",
             "ai_tone": "客服腔/过度礼貌",
+            "cliche_expression": "使用了模板化套话（喝温水/吃热乎的/虚假回忆句式）",
+            "leading_ellipsis": "句首出现了孤立省略号",
             "custom_blocked": "命中了禁用表达",
             "empty": "内容为空",
         }

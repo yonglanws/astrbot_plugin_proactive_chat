@@ -13,7 +13,7 @@ from typing import Any
 
 from astrbot.api import logger
 
-from ..domain.content_text import reduce_record_text
+from ..domain.content_text import reduce_record_text, strip_sticker_tags
 
 _CONV_LOCKS: OrderedDict[str, asyncio.Lock] = OrderedDict()
 _MAX_CONV_LOCKS = 512
@@ -66,7 +66,7 @@ async def verify_message_persisted(
     从历史末尾向前查找最近一条 assistant 记录并做包含匹配；
     任何异常或未命中都返回 False。
     """
-    target = (assistant_response or "").strip()
+    target = strip_sticker_tags(assistant_response)
     if not target:
         return False
     try:
@@ -103,9 +103,12 @@ async def add_message_pair(
     """
     if UserMessageSegment is None or TextPart is None:
         raise RuntimeError("当前 AstrBot 版本缺少消息段 API")
+    clean_response = strip_sticker_tags(assistant_response)
+    if not clean_response:
+        return
     user_msg_obj = UserMessageSegment(content=[TextPart(text=user_prompt)])
     assistant_msg_obj = AssistantMessageSegment(
-        content=[TextPart(text=assistant_response)]
+        content=[TextPart(text=clean_response)]
     )
     await conversation_manager.add_message_pair(
         cid=conv_id,
@@ -128,8 +131,12 @@ async def add_assistant_message(
     if AssistantMessageSegment is None or TextPart is None:
         raise RuntimeError("当前 AstrBot 版本缺少消息段 API")
 
+    clean_response = strip_sticker_tags(assistant_response)
+    if not clean_response:
+        return
+
     assistant_msg_obj = AssistantMessageSegment(
-        content=[TextPart(text=assistant_response)]
+        content=[TextPart(text=clean_response)]
     )
     assistant_msg_dict = assistant_msg_obj.model_dump()
 
@@ -161,7 +168,7 @@ async def add_assistant_message(
         conversation_manager,
         conv_id,
         "[主动消息]",
-        assistant_response,
+        clean_response,
     )
 
 

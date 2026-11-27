@@ -18,6 +18,37 @@ import aiofiles.os as aio_os
 from astrbot.api import logger
 
 
+_SNAPSHOT_CHUNK_SIZE = 64
+_MISSING = object()
+
+
+def _clone_json_value(value: Any) -> Any:
+    """快速浅树拷贝 JSON 值，避免全量 copy.deepcopy 的 dispatch/memo 开销。"""
+    value_type = type(value)
+    if value_type is dict:
+        return {k: _clone_json_value(v) for k, v in value.items()}
+    if value_type is list:
+        return [_clone_json_value(item) for item in value]
+    if value_type in (str, int, float, bool) or value is None:
+        return value
+    return copy.deepcopy(value)
+
+
+async def _snapshot_session_data(session_data: dict) -> dict:
+    """分片合作式快照：每个会话原子克隆，片间让出事件循环以免阻塞心跳与网关。"""
+    if not isinstance(session_data, dict):
+        return _clone_json_value(session_data)
+    keys = list(session_data.keys())
+    snapshot: dict = {}
+    for index, key in enumerate(keys):
+        value = session_data.get(key, _MISSING)
+        if value is not _MISSING:
+            snapshot[key] = _clone_json_value(value)
+        if (index + 1) % _SNAPSHOT_CHUNK_SIZE == 0:
+            await asyncio.sleep(0)
+    return snapshot
+
+
 class SessionStore:
     """负责 session_data.json 的读写、键规范化与无效数据清理。"""
 
@@ -55,9 +86,9 @@ class SessionStore:
         temp_file = self.session_data_file.with_name(
             f"{self.session_data_file.name}.{uuid.uuid4().hex}.tmp"
         )
-        # 快照在事件循环线程内同步完成：deepcopy 期间没有 await，
-        # 不会被其他协程的写入打断；序列化与磁盘写入放到线程池。
-        snapshot = copy.deepcopy(session_data)
+        # 分片克隆每条会话后交由线程池序列化与原子落盘，既不阻塞事件循环，
+        # 也不在 json.dumps 期间受到并发变更的 RuntimeError 干扰。
+        snapshot = await _snapshot_session_data(session_data)
 
         def _write_atomic() -> None:
             """同步写临时文件并原子替换；在线程池中执行避免阻塞事件循环。"""
